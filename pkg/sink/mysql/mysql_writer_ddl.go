@@ -15,6 +15,7 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strconv"
 	"strings"
@@ -64,7 +65,7 @@ func (w *Writer) execDDL(event *commonEvent.DDLEvent) error {
 		}
 	}
 
-	failpoint.Inject("MySQLSinkExecDDLDelay", func(val failpoint.Value) {
+	if val, _err_ := failpoint.Eval(_curpkg_("MySQLSinkExecDDLDelay")); _err_ == nil {
 		delay := time.Hour
 		if seconds, ok := val.(string); ok && seconds != "" {
 			if v, err := strconv.Atoi(strings.TrimSpace(seconds)); err == nil && v > 0 {
@@ -73,12 +74,36 @@ func (w *Writer) execDDL(event *commonEvent.DDLEvent) error {
 		}
 		select {
 		case <-ctx.Done():
-			failpoint.Return(ctx.Err())
+			return ctx.Err()
 		case <-time.After(delay):
 		}
-	})
+	}
 
-	tx, err := w.db.BeginTx(ctx, nil)
+	usePinnedDDLConn := false
+	if val, _err_ := failpoint.Eval(_curpkg_("MySQLSinkUsePinnedDDLConn")); _err_ == nil {
+		usePinnedDDLConn = true
+		if v, ok := val.(bool); ok {
+			usePinnedDDLConn = v
+		}
+	}
+	if usePinnedDDLConn {
+		w.ddlConnMu.Lock()
+		defer w.ddlConnMu.Unlock()
+	}
+
+	var (
+		tx  *sql.Tx
+		err error
+	)
+	if usePinnedDDLConn {
+		conn, err := w.getOrCreateDDLConn(ctx)
+		if err != nil {
+			return err
+		}
+		tx, err = conn.BeginTx(ctx, nil)
+	} else {
+		tx, err = w.db.BeginTx(ctx, nil)
+	}
 	if err != nil {
 		return err
 	}
@@ -106,18 +131,32 @@ func (w *Writer) execDDL(event *commonEvent.DDLEvent) error {
 	}
 
 	ddlTimestamp, useSessionTimestamp := ddlSessionTimestampFromOriginDefault(event, w.cfg.Timezone)
+	skipSetSessionTimestamp := false
+	if useSessionTimestamp {
+		if val, _err_ := failpoint.Eval(_curpkg_("MySQLSinkSkipSetSessionTimestamp")); _err_ == nil {
+			skipSetSessionTimestamp = true
+			if v, ok := val.(bool); ok {
+				skipSetSessionTimestamp = v
+			}
+		}
+	}
 
 	if useSessionTimestamp {
-		// set the session timestamp to match upstream DDL execution time
-		if err := setSessionTimestamp(ctx, tx, ddlTimestamp); err != nil {
-			log.Error("Fail to set session timestamp for DDL",
-				zap.Float64("timestamp", ddlTimestamp),
-				zap.String("query", event.GetDDLQuery()),
-				zap.Error(err))
-			if rbErr := tx.Rollback(); rbErr != nil {
-				log.Error("Failed to rollback", zap.String("changefeed", w.ChangefeedID.String()), zap.Error(rbErr))
+		if skipSetSessionTimestamp {
+			log.Warn("Skip setting session timestamp for DDL due to failpoint",
+				zap.String("query", event.GetDDLQuery()))
+		} else {
+			// set the session timestamp to match upstream DDL execution time
+			if err := setSessionTimestamp(ctx, tx, ddlTimestamp); err != nil {
+				log.Error("Fail to set session timestamp for DDL",
+					zap.Float64("timestamp", ddlTimestamp),
+					zap.String("query", event.GetDDLQuery()),
+					zap.Error(err))
+				if rbErr := tx.Rollback(); rbErr != nil {
+					log.Error("Failed to rollback", zap.String("changefeed", w.ChangefeedID.String()), zap.Error(rbErr))
+				}
+				return err
 			}
-			return err
 		}
 	}
 
@@ -137,13 +176,25 @@ func (w *Writer) execDDL(event *commonEvent.DDLEvent) error {
 	}
 
 	if useSessionTimestamp {
-		// reset session timestamp after DDL execution to avoid affecting subsequent operations
-		if err := resetSessionTimestamp(ctx, tx); err != nil {
-			log.Error("Failed to reset session timestamp after DDL execution", zap.Error(err))
-			if rbErr := tx.Rollback(); rbErr != nil {
-				log.Error("Failed to rollback", zap.String("sql", event.GetDDLQuery()), zap.Error(rbErr))
+		skipResetAfterDDL := false
+		if val, _err_ := failpoint.Eval(_curpkg_("MySQLSinkSkipResetSessionTimestampAfterDDL")); _err_ == nil {
+			skipResetAfterDDL = true
+			if v, ok := val.(bool); ok {
+				skipResetAfterDDL = v
 			}
-			return errors.WrapError(errors.ErrMySQLTxnError, errors.WithMessage(err, fmt.Sprintf("Query info: %s; ", event.GetDDLQuery())))
+		}
+		if skipResetAfterDDL {
+			log.Warn("Skip resetting session timestamp after DDL due to failpoint",
+				zap.String("query", event.GetDDLQuery()))
+		} else {
+			// reset session timestamp after DDL execution to avoid affecting subsequent operations
+			if err := resetSessionTimestamp(ctx, tx); err != nil {
+				log.Error("Failed to reset session timestamp after DDL execution", zap.Error(err))
+				if rbErr := tx.Rollback(); rbErr != nil {
+					log.Error("Failed to rollback", zap.String("sql", event.GetDDLQuery()), zap.Error(rbErr))
+				}
+				return errors.WrapError(errors.ErrMySQLTxnError, errors.WithMessage(err, fmt.Sprintf("Query info: %s; ", event.GetDDLQuery())))
+			}
 		}
 	}
 

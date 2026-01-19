@@ -58,6 +58,9 @@ type Writer struct {
 	ddlTsTableInitMutex sync.Mutex
 	tableSchemaStore    *commonEvent.TableSchemaStore
 
+	ddlConnMu sync.Mutex
+	ddlConn   *sql.Conn
+
 	// implement stmtCache to improve performance, especially when the downstream is TiDB
 	stmtCache *lru.Cache
 
@@ -268,4 +271,22 @@ func (w *Writer) Close() {
 	if w.blockerTicker != nil {
 		w.blockerTicker.Stop()
 	}
+	w.ddlConnMu.Lock()
+	if w.ddlConn != nil {
+		_ = w.ddlConn.Close()
+		w.ddlConn = nil
+	}
+	w.ddlConnMu.Unlock()
+}
+
+func (w *Writer) getOrCreateDDLConn(ctx context.Context) (*sql.Conn, error) {
+	if w.ddlConn != nil {
+		return w.ddlConn, nil
+	}
+	conn, err := w.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	w.ddlConn = conn
+	return conn, nil
 }

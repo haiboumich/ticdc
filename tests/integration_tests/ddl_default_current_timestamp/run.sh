@@ -36,6 +36,25 @@ function run() {
 
 	check_sync_diff $WORK_DIR $CUR/conf/diff_config.toml 120
 	cleanup_process $CDC_BINARY
+
+	failpoints="github.com/pingcap/ticdc/pkg/sink/mysql/MySQLSinkUsePinnedDDLConn=return(true);"
+	failpoints+="github.com/pingcap/ticdc/pkg/sink/mysql/MySQLSinkSkipResetSessionTimestampAfterDDL=1*return(true);"
+	failpoints+="github.com/pingcap/ticdc/pkg/sink/mysql/MySQLSinkSkipSetSessionTimestamp=1*return(false)->1*return(true)"
+	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --failpoint "$failpoints"
+
+	run_sql "SET @@timestamp = 1000000000.123456; ALTER TABLE ${DB_NAME}.t ADD COLUMN c_reset_1 TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6);" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+	run_sql "SET @@timestamp = 1000000002.654321; ALTER TABLE ${DB_NAME}.t ADD COLUMN c_reset_2 TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6);" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+
+	ensure 60 "mysql -h${DOWN_TIDB_HOST} -P${DOWN_TIDB_PORT} -uroot -N -s -e \"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='${DB_NAME}' AND table_name='t' AND column_name='c_reset_2';\" | grep -q '^1$'"
+
+	stale_value=$(mysql -h${DOWN_TIDB_HOST} -P${DOWN_TIDB_PORT} -uroot -N -s -e "SET time_zone = 'UTC'; SELECT FROM_UNIXTIME(1000000000.123456);")
+	reset_value=$(mysql -h${DOWN_TIDB_HOST} -P${DOWN_TIDB_PORT} -uroot -N -s -e "SET time_zone = 'UTC'; SELECT c_reset_2 FROM ${DB_NAME}.t WHERE id = 1;")
+	if [[ "$reset_value" == "$stale_value" ]]; then
+		echo "c_reset_2 reused stale session timestamp: ${reset_value}"
+		exit 1
+	fi
+
+	cleanup_process $CDC_BINARY
 }
 
 if [ "$SINK_TYPE" != "mysql" ]; then
