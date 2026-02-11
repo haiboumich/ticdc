@@ -59,15 +59,41 @@ s.maxPendingSize = DefaultMaxPendingSize // AreaSettings.fix() 在 size<=0 时�
 ### 2 新架构入口：EventCollector 启用 memory control
 
 调用链：
-- EventCollector 初始化 dynstream
-  - 启用 EnableMemoryControl
-    - 创建反馈通道与 memControl 实例
+- 新架构开关（newarch）
+  - newarch=true 时进入新架构 server
+    - setPreServices 创建 EventCollector
+      - EventCollector 动态流启用 EnableMemoryControl
 
+重要结论：**新架构必然启用 memory controller**（EventCollector 动态流硬编码 `EnableMemoryControl=true`）。
+
+#### 2.1 新架构开关与入口（是否必然启用 EventCollector）
 ```golang
+// pkg/config/server.go:91
+Newarch:       false // newarch 默认关闭
+// cmd/cdc/server/server.go:67
+cmd.Flags().BoolVarP(&o.serverConfig.Newarch, "newarch", "x", o.serverConfig.Newarch, "Run the new architecture of TiCDC server") // CLI 开关
+// cmd/cdc/server/server.go:301
+newarch = os.Getenv("TICDC_NEWARCH") == "true" // 环境变量开关
+// cmd/cdc/server/server.go:281
+newarch = isNewArchEnabledByConfig(serverConfigFilePath) // 读取 server 配置文件的 newarch
+// cmd/cdc/server/server.go:368
+if isNewArchEnabled(o) { // newarch=true -> 新架构
+// cmd/cdc/server/server.go:378
+err = o.run(cmd) // 进入新架构 server 运行路径
+// cmd/cdc/server/server.go:382
+return runTiFlowServer(o, cmd) // newarch=false -> 旧架构路径
+```
+
+#### 2.2 新架构下 EventCollector 与 memory control（是否必然启用）
+```golang
+// server/server.go:259
+ec := eventcollector.New(c.info.ID) // 新架构 preServices 中创建 EventCollector
+// server/server.go:261
+ec.Run(ctx) // 启动 EventCollector
 // downstreamadapter/eventcollector/helper.go:26
 option := dynstream.NewOption() // 创建 dynstream 运行参数
 // downstreamadapter/eventcollector/helper.go:30
-option.EnableMemoryControl = true // 在 EventCollector 的动态流中开启 memory control
+option.EnableMemoryControl = true // EventCollector 动态流硬编码开启 memory control
 // utils/dynstream/interfaces.go:217
 EnableMemoryControl bool // memory control 默认关闭，需显式开启
 // utils/dynstream/parallel_dynamic_stream.go:72
