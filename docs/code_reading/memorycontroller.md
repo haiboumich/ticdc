@@ -18,6 +18,8 @@
 
 ### 1 配额来源与可配置入口
 
+summary：说明 MemoryQuota 的来源（默认值、配置入口）与 dynstream 兜底默认值。MemoryQuota 在 cdc 启动阶段就作为配置项引入/校验，但真正生效（作为 area 的上限）是在 changefeed 注册到 EventCollector 时（见第 3 节）。
+
 #### 1.1 默认值
 ```golang
 // pkg/config/server.go:45
@@ -57,6 +59,8 @@ s.maxPendingSize = DefaultMaxPendingSize // AreaSettings.fix() 在 size<=0 时�
 ---
 
 ### 2 新架构入口：EventCollector 启用 memory control
+
+summary：说明“是否必然启用 memory controller”的判断链路：newarch=true 时必然启动 EventCollector，且 dynstream 的 EnableMemoryControl 被硬编码打开。
 
 调用链：
 - 新架构开关（newarch）
@@ -108,6 +112,8 @@ s.memControl = newMemControl[A, P, T, D, H]() // 初始化内存控制器实例
 
 ### 3 changefeed 配额绑定到 AreaSettings（changefeed -> dispatcher -> dynstream）
 
+summary：说明在注册 changefeed/dispatcher 时，MemoryQuota 被传入 dynstream，成为 area 的 `maxPendingSize`（内存上限），并派生 path 的默认上限。
+
 调用链：
 - changefeed 配置
   - DispatcherManager.sinkQuota
@@ -132,6 +138,8 @@ algorithm: memoryControlAlgorithm // 记录使用的内存控制算法类型
 ---
 
 ### 4 dynstream 把 path 加入 area 并挂上 memControl
+
+summary：说明 dynstream 内部如何把 path 归入 area，并绑定 memControl 以建立统计与反馈机制。
 
 调用链：
 - DynamicStream.AddPath
@@ -159,6 +167,8 @@ area.settings.Store(&settings) // 保存 area 的内存上限与算法设置
 ---
 
 ### 5 内存统计与控制核心（append/ratio/释放）
+
+summary：说明事件入队时的内存统计、阈值判定、死锁检测与释放策略（核心控制逻辑）。
 
 调用链：
 - path.appendEvent
@@ -208,6 +218,8 @@ FeedbackType: ReleasePath // 发送 ReleasePath 反馈
 
 ### 6 ReleasePath 反馈执行链（从入口到最底层）
 
+summary：说明 ReleasePath 反馈从 EventCollector 下发到 dynstream 清空队列的完整执行路径。
+
 调用链：
 - EventCollector 接收 ReleasePath
   - dynstream.Release
@@ -237,6 +249,8 @@ as.totalPendingSize.Add(int64(-size)) // decPendingSize 同步扣减 area 总量
 
 ### 7 Pause/Resume 逻辑现状（新架构 vs 老架构）
 
+summary：对比新架构（EventCollector）与旧架构（Puller）的 pause/resume 行为与阈值差异。
+
 调用链：
 - areaMemStat.updateAreaPauseState
   - algorithm.ShouldPauseArea
@@ -263,6 +277,8 @@ if memoryUsageRatio >= 0.8 { ... } // Puller 算法的 area pause 阈值（80%�
 ## B. 参考章节：新架构数据流上层逻辑（代码验证版）
 
 ### 8 新架构数据流上层逻辑（代码验证版）
+
+summary：给出上层数据流（Puller / Sinker）组件分工的代码验证参考，不涉及 memory controller 的细节实现。
 
 #### 8.1 上游获取侧（Puller 责任链）
 ```golang
