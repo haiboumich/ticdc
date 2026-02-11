@@ -2,26 +2,28 @@
 
 说明：以下按“入口 -> 逻辑 -> 最底层释放”的链路组织；每条记录包含 `文件:行号`、代码片段、说明。
 
-目录：
-- A. Memory Controller 运行机制详解（入口 -> 逻辑 -> 释放）
-  - 1 配额来源与可配置入口
-  - 2 新架构入口：EventCollector 启用 memory control
-  - 3 changefeed 配额绑定到 AreaSettings（changefeed -> dispatcher -> dynstream）
-  - 4 dynstream 把 path 加入 area 并挂上 memControl
-  - 5 内存统计与控制核心（append/ratio/释放）
-  - 6 ReleasePath 反馈执行链（从入口到最底层）
-  - 7 Pause/Resume 逻辑现状（新架构 vs 老架构）
-- B. 参考章节：新架构数据流上层逻辑（代码验证版）
-  - 8 新架构数据流上层逻辑（代码验证版）
-- C. 术语汇总小节
+目录:
+- [A. Memory Controller 运行机制详解（入口 -> 逻辑 -> 释放）](#a-memory-controller)
+  - [1 配额来源与可配置入口](#sec-1-memory-quota)
+  - [2 新架构入口：EventCollector 启用 memory control](#sec-2-enable-memory-control)
+  - [3 changefeed 配额绑定到 AreaSettings（changefeed -> dispatcher -> dynstream）](#sec-3-quota-area)
+  - [4 dynstream 把 path 加入 area 并挂上 memControl](#sec-4-add-path-area)
+  - [5 内存统计与控制核心（append/ratio/释放）](#sec-5-core-control)
+  - [6 ReleasePath 反馈执行链（从入口到最底层）](#sec-6-releasepath-flow)
+  - [7 Pause/Resume 逻辑现状（新架构 vs 老架构）](#sec-7-pause-resume)
+- [B. 参考章节：新架构数据流上层逻辑（代码验证版）](#b-highlevel-flow)
+  - [8 新架构数据流上层逻辑（代码验证版）](#sec-8-highlevel)
+- [C. 术语汇总小节](#c-terminology)
 
+<a id="a-memory-controller"></a>
 ## A. Memory Controller 运行机制详解（入口 -> 逻辑 -> 释放）
 
+<a id="sec-1-memory-quota"></a>
 ### 1 配额来源与可配置入口
 
-summary：说明 MemoryQuota（见术语汇总小节）的来源（默认值、配置入口）与 dynstream 兜底默认值。要点如下：
+summary：说明 MemoryQuota（见[术语汇总小节](#c-terminology)）的来源（默认值、配置入口）与 dynstream 兜底默认值。要点如下：
 - MemoryQuota 在 cdc 启动阶段就作为配置项引入/校验。
-- 真正生效（作为 area（见术语汇总小节）的上限）是在 changefeed 注册到 EventCollector（见术语汇总小节）时（见第 3 节）。
+- 真正生效（作为 area（见[术语汇总小节](#c-terminology)）的上限）是在 changefeed 注册到 EventCollector（见[术语汇总小节](#c-terminology)）时（见第 3 节）。
 - dynstream 对未设置的 area 也有 1GB 的默认兜底。
 
 #### 1.1 默认值
@@ -62,20 +64,21 @@ s.maxPendingSize = DefaultMaxPendingSize // AreaSettings.fix() 在 size<=0 时�
 
 ---
 
+<a id="sec-2-enable-memory-control"></a>
 ### 2 新架构入口：EventCollector 启用 memory control
 
-summary：说明“是否必然启用 memory controller（见术语汇总小节）”的判断链路。要点如下：
-- newarch（见术语汇总小节）=true 时进入新架构 server。
-- 新架构会启动 EventCollector（见术语汇总小节）。
+summary：说明“是否必然启用 memory controller（见[术语汇总小节](#c-terminology)）”的判断链路。要点如下：
+- newarch（见[术语汇总小节](#c-terminology)）=true 时进入新架构 server。
+- 新架构会启动 EventCollector（见[术语汇总小节](#c-terminology)）。
 - EventCollector 动态流硬编码启用 EnableMemoryControl。
 
 调用链：
-- 新架构开关（newarch）
+- 新架构开关（newarch，见[术语汇总小节](#c-terminology)）
   - newarch=true 时进入新架构 server
-    - setPreServices 创建 EventCollector
-      - EventCollector 动态流启用 EnableMemoryControl
+    - setPreServices 创建 EventCollector（见[术语汇总小节](#c-terminology)）
+      - EventCollector（见[术语汇总小节](#c-terminology)）动态流启用 EnableMemoryControl
 
-重要结论：**新架构必然启用 memory controller（见术语汇总小节）**（EventCollector 动态流硬编码 `EnableMemoryControl=true`）。
+重要结论：**新架构必然启用 memory controller（见[术语汇总小节](#c-terminology)）**（EventCollector 动态流硬编码 `EnableMemoryControl=true`）。
 
 #### 2.1 新架构开关与入口（是否必然启用 EventCollector）
 ```golang
@@ -117,10 +120,10 @@ s.memControl = newMemControl[A, P, T, D, H]() // 初始化内存控制器实例
 
 #### 2.3 memory control 算法选择（配置项/硬编码）
 
-summary：说明 memory control 算法（见术语汇总小节）的选择与配置。要点如下：
-- 算法类型只有两种：MemoryControlForPuller（见术语汇总小节）与 MemoryControlForEventCollector（见术语汇总小节）。
+summary：说明 memory control 算法（见[术语汇总小节](#c-terminology)）的选择与配置。要点如下：
+- 算法类型只有两种：MemoryControlForPuller（见[术语汇总小节](#c-terminology)）与 MemoryControlForEventCollector（见[术语汇总小节](#c-terminology)）。
 - 当前没有用户可配置项；EventCollector 在创建 AreaSettings 时硬编码为 MemoryControlForEventCollector。
-- 默认情况：新架构 EventCollector（见术语汇总小节）使用 MemoryControlForEventCollector；NewMemoryControlAlgorithm 在未指定为 EventCollector 算法时默认走 Puller 算法（见术语汇总小节）。
+- 默认情况：新架构 EventCollector（见[术语汇总小节](#c-terminology)）使用 MemoryControlForEventCollector；NewMemoryControlAlgorithm 在未指定为 EventCollector 算法时默认走 Puller 算法（见[术语汇总小节](#c-terminology)）。
 
 ```golang
 // utils/dynstream/memory_control.go:28-34
@@ -141,17 +144,18 @@ default:
 
 ---
 
+<a id="sec-3-quota-area"></a>
 ### 3 changefeed 配额绑定到 AreaSettings（changefeed -> dispatcher -> dynstream）
 
 summary：说明在注册 changefeed/dispatcher 时，MemoryQuota 被传入 dynstream，成为 area 的上限。要点如下：
 - DispatcherManager 从 changefeed 配置读 MemoryQuota。
 - EventCollector.AddDispatcher 把配额传给 dynstream。
-- area（见术语汇总小节）的 `maxPendingSize` 直接等于 MemoryQuota，path（见术语汇总小节）上限派生为 10%（最少 1MB）。
+- area（见[术语汇总小节](#c-terminology)）的 `maxPendingSize` 直接等于 MemoryQuota，path（见[术语汇总小节](#c-terminology)）上限派生为 10%（最少 1MB）。
 
 调用链：
 - changefeed 配置
   - DispatcherManager.sinkQuota
-    - EventCollector.AddDispatcher
+    - EventCollector.AddDispatcher（EventCollector 见[术语汇总小节](#c-terminology)）
       - dynstream.NewAreaSettingsWithMaxPendingSize
 
 ```golang
@@ -171,9 +175,10 @@ algorithm: memoryControlAlgorithm // 记录使用的内存控制算法类型
 
 ---
 
+<a id="sec-4-add-path-area"></a>
 ### 4 dynstream 把 path 加入 area 并挂上 memControl
 
-summary：说明 dynstream 内部如何把 path（见术语汇总小节）归入 area（见术语汇总小节），并绑定 memControl。要点如下：
+summary：说明 dynstream 内部如何把 path（见[术语汇总小节](#c-terminology)）归入 area（见[术语汇总小节](#c-terminology)），并绑定 memControl。要点如下：
 - AddPath 触发 setMemControl。
 - memControl.addPathToArea 创建或复用 area 统计结构。
 - path 绑定 areaMemStat，记录 path 数量并保存 settings。
@@ -182,7 +187,7 @@ summary：说明 dynstream 内部如何把 path（见术语汇总小节）归入
 - DynamicStream.AddPath
   - setMemControl
     - memControl.addPathToArea
-      - newAreaMemStat / 绑定 settings
+      - newAreaMemStat / 绑定 settings（area/path 见[术语汇总小节](#c-terminology)）
 
 ```golang
 // utils/dynstream/parallel_dynamic_stream.go:197
@@ -203,38 +208,39 @@ area.settings.Store(&settings) // 保存 area 的内存上限与算法设置
 
 ---
 
+<a id="sec-5-core-control"></a>
 ### 5 内存统计与控制核心（append/ratio/释放）
 
 summary：说明事件入队时的内存统计、阈值判定、死锁检测与释放策略（核心控制逻辑）。结构化说明如下：
-- 入队前处理
-  - 对 PeriodicSignal（见术语汇总小节）做“最后一条覆盖”合并，避免信号膨胀。
-- releaseMemory 的触发入口（仅 EventCollector 算法（见术语汇总小节））
-  - 死锁检测分支：满足“5s 内有新事件进入且 5s 内无 size 减少”并且“内存占用 > 60%”时触发 releaseMemory。
-  - 高水位分支：内存占用比例 >= 1.5（150%）时立即触发 releaseMemory，并对可丢弃事件（Droppable，见术语汇总小节）调用 OnDrop 转换为 drop 事件入队。
+- 入队前处理（入队到 path 队列前）
+  - 对 PeriodicSignal（见[术语汇总小节](#c-terminology)）做“最后一条覆盖”合并，避免信号膨胀。
+- releaseMemory 的触发入口（仅 EventCollector 算法（见[术语汇总小节](#c-terminology)））
+  - 死锁检测分支：满足“5s 内有事件进入 path 队列且 5s 内无 size 减少”并且“内存占用 > 60%”时触发 releaseMemory。
+  - 高水位分支：内存占用比例 >= 1.5（150%）时立即触发 releaseMemory，并对可丢弃事件（Droppable，见[术语汇总小节](#c-terminology)）调用 OnDrop 转换为 drop 事件并入队到 path 队列。
 - releaseMemory 的执行规则
-  - 按 lastHandleEventTs 降序挑选 path（见术语汇总小节），只释放 blocking 且 pendingSize >= 256 的 path。
-  - 目标释放量为总 pending 的 40%，通过 ReleasePath（见术语汇总小节）反馈通知下游执行清理。
+  - 按 lastHandleEventTs 降序挑选 path（见[术语汇总小节](#c-terminology)），只释放 blocking 且 pendingSize >= 256 的 path。
+  - 目标释放量为总 pending 的 40%，通过 ReleasePath（见[术语汇总小节](#c-terminology)）反馈通知下游执行清理。
 - 统计更新
-  - 最终将事件入队并更新 path（见术语汇总小节）/area（见术语汇总小节）的 pendingSize 统计。
+  - 最终将事件入队到 path 队列并更新 path（见[术语汇总小节](#c-terminology)）/area（见[术语汇总小节](#c-terminology)）的 pendingSize 统计。
 
-术语说明：可丢弃事件（Droppable）（见术语汇总小节）
+术语说明：可丢弃事件（Droppable）（见[术语汇总小节](#c-terminology)）
 - 含义：EventType.Droppable=true 的事件可被内存控制丢弃。
 - 代码引用：见下方代码片段（EventType.Droppable 定义 + OnDrop 分支）。
 
-术语说明：PeriodicSignal（见术语汇总小节）
+术语说明：PeriodicSignal（见[术语汇总小节](#c-terminology)）
 - 含义：一种“周期性信号”事件类型（如 resolvedTs），不携带业务数据，可用最新信号覆盖旧信号以减小队列压力。
 - 代码引用：见下方代码片段（Property.PeriodicSignal 定义与注释）。
 
 调用链：
-- path.appendEvent
+- path.appendEvent（path 见[术语汇总小节](#c-terminology)）
   - areaMemStat.appendEvent
     - 统计 size / 判定 deadlock / 触发 release
 
 ```golang
 // utils/dynstream/stream.go:370
-func (pi *pathInfo...) appendEvent(...) bool // path 收到事件进入内存控制链路的入口
+func (pi *pathInfo...) appendEvent(...) bool // path 收到事件，准备入队到 path 队列的入口
 // utils/dynstream/stream.go:372
-return pi.areaMemStat.appendEvent(pi, event, handler) // 事件交给 areaMemStat 做统一计量与控制
+return pi.areaMemStat.appendEvent(pi, event, handler) // 事件交给 areaMemStat 做统一计量并最终入队到 path 队列
 // utils/dynstream/memory_control.go:101
 defer as.updateAreaPauseState(path) // 事件追加后更新 area 状态（新架构不触发暂停）
 // utils/dynstream/memory_control.go:121
@@ -242,9 +248,9 @@ if as.checkDeadlock() { as.releaseMemory() } // 检测疑似死锁并触发释�
 // utils/dynstream/memory_control.go:125
 if as.memoryUsageRatio() >= 1.5 && ... // 内存>150% 且为 EventCollector 算法时强制释放
 // utils/dynstream/memory_control.go:128
-if event.eventType.Droppable { ... handler.OnDrop(...) } // 可丢弃事件会转换成 drop 事件
+if event.eventType.Droppable { ... handler.OnDrop(...) } // 可丢弃事件会转换成 drop 事件并入队到 path 队列
 // utils/dynstream/memory_control.go:152
-path.pendingQueue.PushBack(event) // 事件入队列
+path.pendingQueue.PushBack(event) // 事件入队到 path 队列
 // utils/dynstream/memory_control.go:154
 path.updatePendingSize(int64(event.eventSize)) // 更新 path 级待处理字节数
 // utils/dynstream/memory_control.go:155
@@ -269,7 +275,7 @@ if ... !path.blocking.Load() { continue } // 只选择阻塞 path 进行释放
 FeedbackType: ReleasePath // 发送 ReleasePath 反馈
 ```
 
-可丢弃事件（Droppable）（见术语汇总小节）相关代码片段：
+可丢弃事件（Droppable）（见[术语汇总小节](#c-terminology)）相关代码片段：
 ```golang
 // utils/dynstream/interfaces.go:41-48
 type EventType struct { // EventType 内标记是否可丢弃
@@ -281,7 +287,7 @@ type EventType struct { // EventType 内标记是否可丢弃
 if event.eventType.Droppable { ... handler.OnDrop(...) } // 可丢弃事件触发 OnDrop
 ```
 
-PeriodicSignal（见术语汇总小节）相关代码片段：
+PeriodicSignal（见[术语汇总小节](#c-terminology)）相关代码片段：
 ```golang
 // utils/dynstream/interfaces.go:59-69
 // PeriodicSignal - Periodic signal events
@@ -295,20 +301,21 @@ PeriodicSignal
 
 ---
 
+<a id="sec-6-releasepath-flow"></a>
 ### 6 ReleasePath 反馈执行链（从入口到最底层）
 
-summary：说明 ReleasePath（见术语汇总小节）反馈从 EventCollector 下发到 dynstream 清空队列的完整执行链路。关键步骤如下：
+summary：说明 ReleasePath（见[术语汇总小节](#c-terminology)）反馈从 EventCollector 下发到 dynstream 清空队列的完整执行链路。关键步骤如下：
 - EventCollector 的 processDSFeedback 仅处理 ReleasePath（分别来自 ds 与 redoDs）。
 - 收到 ReleasePath 后调用 ds.Release(path)。
 - dynstream 将 release 信号注入对应 stream。
-- handleLoop 识别 release 事件并调用 eventQueue.releasePath 清空该 path（见术语汇总小节）队列。
-- 清空后同步扣减 area（见术语汇总小节）/path（见术语汇总小节）的 pendingSize，最终归零。
+- handleLoop 识别 release 事件并调用 eventQueue.releasePath 清空该 path（见[术语汇总小节](#c-terminology)）队列。
+- 清空后同步扣减 area（见[术语汇总小节](#c-terminology)）/path（见[术语汇总小节](#c-terminology)）的 pendingSize，最终归零。
 
 调用链：
-- EventCollector 接收 ReleasePath
+- EventCollector（见[术语汇总小节](#c-terminology)）接收 ReleasePath（见[术语汇总小节](#c-terminology)）
   - dynstream.Release
     - stream 收到 release 信号
-      - eventQueue 清空 path
+      - eventQueue 清空 path（见[术语汇总小节](#c-terminology)）
 
 ```golang
 // downstreamadapter/eventcollector/event_collector.go:423
@@ -331,9 +338,10 @@ as.totalPendingSize.Add(int64(-size)) // decPendingSize 同步扣减 area 总量
 
 ---
 
+<a id="sec-7-pause-resume"></a>
 ### 7 Pause/Resume 逻辑现状（新架构 vs 老架构）
 
-summary：对比新架构（EventCollector 算法，见术语汇总小节）与旧架构（Puller 算法，见术语汇总小节）的 pause/resume 行为与阈值差异。要点如下：
+summary：对比新架构（EventCollector 算法，见[术语汇总小节](#c-terminology)）与旧架构（Puller 算法，见[术语汇总小节](#c-terminology)）的 pause/resume 行为与阈值差异。要点如下：
 - EventCollector 算法不触发 area pause/resume（仅计算比例）。
 - Puller 算法有固定阈值：path 20/10，area 80/50。
 
@@ -360,13 +368,15 @@ if memoryUsageRatio < 0.5 { ... } // Puller 算法的 area resume 阈值（50%�
 if memoryUsageRatio >= 0.8 { ... } // Puller 算法的 area pause 阈值（80%）
 ```
 
+<a id="b-highlevel-flow"></a>
 ## B. 参考章节：新架构数据流上层逻辑（代码验证版）
 
+<a id="sec-8-highlevel"></a>
 ### 8 新架构数据流上层逻辑（代码验证版）
 
-summary：给出上层数据流（Puller / Sinker，见术语汇总小节）组件分工的代码验证参考。要点如下：
+summary：给出上层数据流（Puller / Sinker，见[术语汇总小节](#c-terminology)）组件分工的代码验证参考。要点如下：
 - Puller 侧：SubscriptionClient / EventStore / EventService。
-- Sinker 侧：EventCollector（见术语汇总小节）/ Dispatcher / Sink。
+- Sinker 侧：EventCollector（见[术语汇总小节](#c-terminology)）/ Dispatcher / Sink。
 - 编排模块（如 HeartbeatCollector、DispatcherOrchestrator）不完全属于拉或写。
 
 #### 8.1 上游获取侧（Puller 责任链）
@@ -403,6 +413,7 @@ preServices ... [PDClock, MessageCenter, EventCollector, HeartbeatCollector, Dis
 subModules ... [SubscriptionClient, SchemaStore, MaintainerManager, EventStore, EventService] // 上游拉取与元信息模块在 subModules 中启动
 ```
 
+<a id="c-terminology"></a>
 ## C. 术语汇总小节
 
 - memory controller：dynstream 的内存控制模块，负责统计 pendingSize、触发 ReleasePath 等反馈。参考：`utils/dynstream/memory_control.go:293`、`utils/dynstream/memory_control.go:302`、`utils/dynstream/parallel_dynamic_stream.go:72-75`。
