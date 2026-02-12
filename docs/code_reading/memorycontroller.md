@@ -39,6 +39,78 @@ summary：
 - **前置条件**
     - 新架构开关 [newarch](#c-terminology) 启用且 [EventCollector](#c-terminology) 正常运行（见第 2 节）。
 
+架构层次图：
+```
+╔═════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                                        业务层 (Business Layer)                                   ║
+╠═════════════════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                                 ║
+║   Changefeed (复制任务)                                                                          ║
+║   ├── 配置：MemoryQuota, SyncPoint, Redo...                                                     ║
+║   ├── 包含多个 Dispatcher                                                                        ║
+║   │                                                                                             ║
+║   │   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                                        ║
+║   │   │ Dispatcher  │  │ Dispatcher  │  │ Dispatcher  │  ← 每个表一个 Dispatcher                ║
+║   │   │ (table_1)   │  │ (table_2)   │  │ (table_N)   │                                        ║
+║   │   │             │  │             │  │             │                                        ║
+║   │   │ - 处理事件   │  │ - 处理事件   │  │ - 处理事件   │                                        ║
+║   │   │ - 写入下游   │  │ - 写入下游   │  │ - 写入下游   │                                        ║
+║   │   └─────────────┘  └─────────────┘  └─────────────┘                                        ║
+║   │                                                                                             ║
+║   └── 关系：Changefeed 1 : N Dispatcher (包含关系)                                               ║
+║                                                                                                 ║
+╚═════════════════════════════════════════════════════════════════════════════════════════════════╝
+                                         │
+                                         │ EventCollector 把业务概念映射到 Dynstream 抽象
+                                         │   Changefeed → Area
+                                         │   Dispatcher → Path
+                                         ▼
+╔═════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                                    基础设施层 (Infrastructure Layer)                              ║
+╠═════════════════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                                 ║
+║   DynamicStream (通用事件处理框架，package: dynstream)                                            ║
+║   ├── 职责：事件分发、队列管理、内存控制                                                            ║
+║   ├── 本身不处理业务逻辑，只提供框架能力                                                            ║
+║   │                                                                                             ║
+║   │   ┌─────────────────────────────────────────────────────────────────────────────────────┐   ║
+║   │   │  memControl (内存控制器)                                                              │   ║
+║   │   │    └── areaMap: map[Area]*areaMemStat                                                │   ║
+║   │   │                                                                                     │   ║
+║   │   │          Area (对应 Changefeed)                                                      │   ║
+║   │   │          ├── maxPendingSize = MemoryQuota                                            │   ║
+║   │   │          ├── totalPendingSize (所有 path 的内存总和)                                   │   ║
+║   │   │          ├── algorithm (EventCollector/Puller)                                       │   ║
+║   │   │          │                                                                           │   ║
+║   │   │          │   ┌─────────┐  ┌─────────┐  ┌─────────┐                                  │   ║
+║   │   │          │   │ Path    │  │ Path    │  │ Path    │  ← 对应 Dispatcher                │   ║
+║   │   │          │   │         │  │         │  │         │                                  │   ║
+║   │   │          │   │ pending │  │ pending │  │ pending │                                  │   ║
+║   │   │          │   │ Queue   │  │ Queue   │  │ Queue   │                                  │   ║
+║   │   │          │   └─────────┘  └─────────┘  └─────────┘                                  │   ║
+║   │   │          │                                                                           │   ║
+║   │   │          └── 关系：Area 1 : N Path (分组关系，用于内存统计)                             │   ║
+║   │   │                                                                                     │   ║
+║   │   └─────────────────────────────────────────────────────────────────────────────────────┘   ║
+║   │                                                                                             ║
+║   │   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                                    ║
+║   │   │  stream[0]   │  │  stream[1]   │  │  stream[N]   │  ← 并行处理 worker                  ║
+║   │   └──────────────┘  └──────────────┘  └──────────────┘                                    ║
+║   │                                                                                             ║
+║   └── 注：DynamicStream 是通用框架，可用于其他场景（如 LogPuller 也用它）                           ║
+║                                                                                                 ║
+╚═════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+关键区别：
+┌─────────────────┬──────────────────────────────────────────────────────────────────┐
+│ 层次            │ 说明                                                             │
+├─────────────────┼──────────────────────────────────────────────────────────────────┤
+│ 业务层          │ Changefeed/Dispatcher 是 TiCDC 的业务概念，有实际的包含关系        │
+│ 基础设施层      │ Area/Path 是 Dynstream 的抽象概念，用于事件分组和内存统计          │
+│ 映射关系        │ EventCollector 负责把业务概念映射到基础设施抽象                    │
+└─────────────────┴──────────────────────────────────────────────────────────────────┘
+```
+
 时序图（完整流程）：
 ```
                                     ╔═════════════════════════════════════════════════════════════════════════════════╗
@@ -661,14 +733,28 @@ subModules ... [SubscriptionClient, SchemaStore, MaintainerManager, EventStore, 
 - memory controller：dynstream 的内存控制模块，负责统计 pendingSize、触发 ReleasePath 等反馈。参考：`utils/dynstream/memory_control.go:293`、`utils/dynstream/memory_control.go:302`、`utils/dynstream/parallel_dynamic_stream.go:72-75`。
 - MemoryQuota：changefeed 内存配额（字节）。默认 1GB；用于设置 area 的 maxPendingSize。参考：`pkg/config/server.go:45`、`pkg/config/replica_config.go:47`、`downstreamadapter/eventcollector/event_collector.go:270`。
 - newarch：新架构开关。支持 `--newarch/-x`、`TICDC_NEWARCH=true`、配置 `newarch=true`。参考：`cmd/cdc/server/server.go:67`、`cmd/cdc/server/server.go:301`、`cmd/cdc/server/server.go:281`。
-- EventCollector：新架构下游入口组件，在 preServices 中启动。参考：`server/server.go:259`。
-- DynamicStream：dynstream 动态流调度组件，承载 path/area 与内存控制逻辑。参考：`utils/dynstream/parallel_dynamic_stream.go:72-90`。
-- EventCollector 算法：`MemoryControlForEventCollector=1`，EventCollector 动态流使用该算法。参考：`utils/dynstream/memory_control.go:31`、`downstreamadapter/eventcollector/event_collector.go:270`。
-- Puller 算法：`MemoryControlForPuller=0`，`NewMemoryControlAlgorithm` 默认分支。参考：`utils/dynstream/memory_control.go:28-30`、`utils/dynstream/memory_control_algorithm.go:30-35`。
-- Puller（数据拉取侧）：以 SubscriptionClient / EventStore / EventService 为核心的上游拉取链路。参考：`server/server.go:188-223`。
-- Sinker（数据写入侧）：以 EventCollector / Dispatcher / Sink 为核心的下游写入链路。参考：`server/server.go:259`、`downstreamadapter/dispatchermanager/dispatcher_manager.go:218`。
-- path：dynstream 中的目的端唯一标识；在 EventCollector 中由 `EventsHandler.Path` 返回 `DispatcherID`。参考：`utils/dynstream/interfaces.go:23`、`downstreamadapter/eventcollector/helper.go:67-68`。
-- area：dynstream 中的 path 分组；在 EventCollector 动态流里 area 类型为 `common.GID`。参考：`utils/dynstream/interfaces.go:26`、`downstreamadapter/eventcollector/helper.go:25`。
+- EventCollector：下游侧入口网关组件，作为 EventService 与 Dispatcher 之间的中继。**注意：名字有误导性**，实际职责不是"收集"，而是"路由/分发"：
+    - 接收 EventService 发来的事件（通过 MessageCenter）。
+    - 通过 DynamicStream 把事件分发到对应的 Dispatcher。
+    - 管理 Dispatcher 注册/注销（AddDispatcher / RemoveDispatcher）。
+    - 处理内存控制反馈（ReleasePath），汇报可用内存给 EventService。
+    - 更准确的名字应该是 EventRouter 或 EventRelay。
+    - 参考：`downstreamadapter/eventcollector/event_collector.go:105-110`、`server/server.go:259`。
+- DynamicStream（又名 dynstream）：通用事件处理框架，提供事件分发、队列管理、内存控制能力。
+    - **本身不处理业务逻辑**，只提供基础设施能力。
+    - 是通用框架，可用于多种场景（EventCollector、LogPuller 都用它）。
+    - 包名是 `dynstream`，接口名是 `DynamicStream`，指同一个东西。
+    - 参考：`utils/dynstream/parallel_dynamic_stream.go:30-46`。
+- Area：DynamicStream 中的**分组概念**（类型参数），用于内存统计。
+    - 在 EventCollector 中映射为 `ChangefeedID`。
+    - 一个 Area 包含多个 Path，共享内存配额。
+    - 参考：`utils/dynstream/interfaces.go:26`、`downstreamadapter/eventcollector/helper.go:157-159`。
+- Path：DynamicStream 中的**目的端标识**（类型参数），对应一个事件队列。
+    - 在 EventCollector 中映射为 `DispatcherID`。
+    - 每个 Path 有独立的 pendingQueue 和 pendingSize。
+    - 参考：`utils/dynstream/interfaces.go:23`、`downstreamadapter/eventcollector/helper.go:67-69`。
+- EventCollector 算法：`MemoryControlForEventCollector=1`，EventCollector 动态流使用的内存控制算法。不走 pause/resume，而是用 ReleasePath 清空队列。参考：`utils/dynstream/memory_control.go:31`、`utils/dynstream/memory_control_algorithm.go:159-163`。
+- Puller 算法：`MemoryControlForPuller=0`，`NewMemoryControlAlgorithm` 默认分支。使用 pause/resume 机制控制内存。参考：`utils/dynstream/memory_control.go:28-30`、`utils/dynstream/memory_control_algorithm.go:43-76`。
 - PeriodicSignal：`EventType.Property` 的一种，表示周期性信号事件。参考：`utils/dynstream/interfaces.go:63-69`。
 - Droppable：`EventType.Droppable=true` 表示事件可被内存控制丢弃。参考：`utils/dynstream/interfaces.go:41-48`。
 - ReleasePath：dynstream 反馈类型，表示释放/丢弃某 path 的队列事件。参考：`utils/dynstream/interfaces.go:281-289`。
