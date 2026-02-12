@@ -19,24 +19,25 @@
 ## A. Memory Controller 运行机制详解（入口 -> 逻辑 -> 释放）
 
 summary：
-- 范围与非目标
-- 覆盖新架构 [EventCollector](#c-terminology) + [DynamicStream](#c-terminology) 的 [memory controller](#c-terminology) 链路（包含 [path](#c-terminology)/[area](#c-terminology) 统计与 [ReleasePath](#c-terminology)）。
- - 不覆盖 EventService scan 限流与下游 sink 写入行为（见第 8 节的上层链路参考）。
-- 关键角色/组件
-- [EventCollector](#c-terminology)：内存控制入口与反馈汇聚。
-- [memory controller](#c-terminology)：执行统计、阈值判断与释放策略。
-- [path](#c-terminology)/[area](#c-terminology)：内存统计的最小粒度与分组边界。
-- 主数据/控制流
-- changefeed 配额 -> EventCollector.AddDispatcher -> [DynamicStream](#c-terminology) [area](#c-terminology)/[path](#c-terminology) -> appendEvent -> releaseMemory -> [ReleasePath](#c-terminology) 反馈 -> 清空 [path](#c-terminology) 队列。
-- 关键状态/策略
-- deadlock 与高水位两类触发入口；阈值与释放比例见第 5 节。
-- [EventCollector](#c-terminology) 算法不走 pause/resume（见第 7 节）。
-- 可靠性与降级
- - [ReleasePath](#c-terminology) 通过“丢弃/清空”降内存；可丢弃事件走 OnDrop 分支（见第 5/6 节）。
-- 可观测性
- - 以内存占用比例与 pendingSize 为核心判定依据（见第 5 节的 memoryUsageRatio/totalPendingSize）。
-- 关键假设/前置条件
- - 新架构开关 [newarch](#c-terminology) 启用且 [EventCollector](#c-terminology) 正常运行（见第 2 节）。
+- **文档范围**
+    - 覆盖新架构 [EventCollector](#c-terminology) + [DynamicStream](#c-terminology) 的 [memory controller](#c-terminology) 链路（包含 [path](#c-terminology)/[area](#c-terminology) 统计与 [ReleasePath](#c-terminology)）。
+- **不涉及内容**
+    - EventService scan 限流与下游 sink 写入行为（见第 8 节的上层链路参考）。
+- **关键组件**
+    - [EventCollector](#c-terminology)：内存控制入口与反馈汇聚。
+    - [memory controller](#c-terminology)：执行统计、阈值判断与释放策略。
+    - [path](#c-terminology)/[area](#c-terminology)：内存统计的最小粒度与分组边界。
+- **主数据流**
+    - changefeed 配额 -> EventCollector.AddDispatcher -> [DynamicStream](#c-terminology) [area](#c-terminology)/[path](#c-terminology) -> appendEvent -> releaseMemory -> [ReleasePath](#c-terminology) 反馈 -> 清空 [path](#c-terminology) 队列。
+- **关键策略**
+    - deadlock 与高水位两类触发入口；阈值与释放比例见第 5 节。
+    - [EventCollector](#c-terminology) 算法不走 pause/resume（见第 7 节）。
+- **降级机制**
+    - [ReleasePath](#c-terminology) 通过"丢弃/清空"降内存；可丢弃事件走 OnDrop 分支（见第 5/6 节）。
+- **可观测性**
+    - 以内存占用比例与 pendingSize 为核心判定依据（见第 5 节的 memoryUsageRatio/totalPendingSize）。
+- **前置条件**
+    - 新架构开关 [newarch](#c-terminology) 启用且 [EventCollector](#c-terminology) 正常运行（见第 2 节）。
 
 时序图（简化）：
 ```
@@ -272,16 +273,16 @@ area.settings.Store(&settings) // 保存 area 的内存上限与算法设置
 ### 5 内存统计与控制核心（append/ratio/释放）
 
 summary：说明事件入队时的内存统计、阈值判定、死锁检测与释放策略（核心控制逻辑）。结构化说明如下：
-- 入队前处理（入队到 path 队列前）
- - 对 [PeriodicSignal](#c-terminology) 做"最后一条覆盖"合并，避免信号膨胀。
-- releaseMemory 的触发入口（仅 EventCollector 算法）
- - 死锁检测分支：满足"5s 内有事件进入 path 队列且 5s 内无 size 减少"并且"内存占用 > 60%"时触发 releaseMemory。
- - 高水位分支：内存占用比例 >= 1.5（150%）时立即触发 releaseMemory，并对可丢弃事件（[Droppable](#c-terminology)）调用 OnDrop 转换为 drop 事件并入队到 path 队列。
-- releaseMemory 的执行规则
- - 按 lastHandleEventTs 降序挑选 [path](#c-terminology)，只释放 blocking 且 pendingSize >= 256 的 path。
- - 目标释放量为总 pending 的 40%，通过 [ReleasePath](#c-terminology) 反馈通知下游执行清理。
-- 统计更新
- - 最终将事件入队到 path 队列并更新 [path](#c-terminology)/[area](#c-terminology) 的 pendingSize 统计。
+- **入队前处理（入队到 path 队列前）**
+    - 对 [PeriodicSignal](#c-terminology) 做"最后一条覆盖"合并，避免信号膨胀。
+- **releaseMemory 的触发入口（仅 EventCollector 算法）**
+    - 死锁检测分支：满足"5s 内有事件进入 path 队列且 5s 内无 size 减少"并且"内存占用 > 60%"时触发 releaseMemory。
+    - 高水位分支：内存占用比例 >= 1.5（150%）时立即触发 releaseMemory，并对可丢弃事件（[Droppable](#c-terminology)）调用 OnDrop 转换为 drop 事件并入队到 path 队列。
+- **releaseMemory 的执行规则**
+    - 按 lastHandleEventTs 降序挑选 [path](#c-terminology)，只释放 blocking 且 pendingSize >= 256 的 path。
+    - 目标释放量为总 pending 的 40%，通过 [ReleasePath](#c-terminology) 反馈通知下游执行清理。
+- **统计更新**
+    - 最终将事件入队到 path 队列并更新 [path](#c-terminology)/[area](#c-terminology) 的 pendingSize 统计。
 
 时序图：
 ```
