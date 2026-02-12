@@ -215,6 +215,34 @@ summary：说明 dynstream 内部如何把 [path](#c-terminology) 归入 [area](
 - memControl.addPathToArea 创建或复用 area 统计结构。
 - path 绑定 areaMemStat，记录 path 数量并保存 settings。
 
+时序图：
+```
+EventCollector                    DynamicStream                     memControl                    areaMemStat
+    |                                  |                                |                              |
+    | --(AddDispatcher)-------------> |                                |                              |
+    |                                  |                              |                              |
+    |                                  | --(AddPath)-----------------> |                              |
+    |                                  |   [path, AreaSettings]        |                              |
+    |                                  |                                |                              |
+    |                                  |                    [setMemControl]                             |
+    |                                  |                                |                              |
+    |                                  |                                | --(addPathToArea)----------> |
+    |                                  |                                |   [path, settings, feedback] |
+    |                                  |                                |                              |
+    |                                  |                                |               [查找或创建 area]|
+    |                                  |                                |                              |
+    |                                  |                                |      [绑定 path.areaMemStat]  |
+    |                                  |                                |                              |
+    |                                  |                                | <----(areaMemStat)---------- |
+    |                                  |                                |                              |
+    |                                  | <-----(path 绑定完成)----------|                              |
+    |                                  |                                |                              |
+    | <----(AddDispatcher 完成)------- |                                |                              |
+    |                                  |                                |                              |
+
+注：areaMemStat 负责统计 area 级 pendingSize，path 持有其引用以更新统计。
+```
+
 调用链：
 - DynamicStream.AddPath
  - setMemControl
@@ -245,15 +273,53 @@ area.settings.Store(&settings) // 保存 area 的内存上限与算法设置
 
 summary：说明事件入队时的内存统计、阈值判定、死锁检测与释放策略（核心控制逻辑）。结构化说明如下：
 - 入队前处理（入队到 path 队列前）
- - 对 [PeriodicSignal](#c-terminology) 做“最后一条覆盖”合并，避免信号膨胀。
+ - 对 [PeriodicSignal](#c-terminology) 做"最后一条覆盖"合并，避免信号膨胀。
 - releaseMemory 的触发入口（仅 EventCollector 算法）
- - 死锁检测分支：满足“5s 内有事件进入 path 队列且 5s 内无 size 减少”并且“内存占用 > 60%”时触发 releaseMemory。
+ - 死锁检测分支：满足"5s 内有事件进入 path 队列且 5s 内无 size 减少"并且"内存占用 > 60%"时触发 releaseMemory。
  - 高水位分支：内存占用比例 >= 1.5（150%）时立即触发 releaseMemory，并对可丢弃事件（[Droppable](#c-terminology)）调用 OnDrop 转换为 drop 事件并入队到 path 队列。
 - releaseMemory 的执行规则
  - 按 lastHandleEventTs 降序挑选 [path](#c-terminology)，只释放 blocking 且 pendingSize >= 256 的 path。
  - 目标释放量为总 pending 的 40%，通过 [ReleasePath](#c-terminology) 反馈通知下游执行清理。
 - 统计更新
  - 最终将事件入队到 path 队列并更新 [path](#c-terminology)/[area](#c-terminology) 的 pendingSize 统计。
+
+时序图：
+```
+path.appendEvent                areaMemStat                    releaseMemory               feedbackChan
+      |                             |                              |                           |
+      | --(appendEvent)-----------> |                              |                           |
+      |   [event, handler]          |                              |                           |
+      |                             |                              |                           |
+      |                             | [checkDeadlock]              |                           |
+      |                             |   hasEventComeButNotOut?     |                           |
+      |                             |   memoryUsageRatio > 60%?    |                           |
+      |                             |                              |                           |
+      |                             |---[deadlock?]--------------->|                           |
+      |                             |                              |                           |
+      |                             |                              | [按 lastHandleEventTs     |
+      |                             |                              |  降序选择 blocking path]  |
+      |                             |                              |                           |
+      |                             |                              | [发送 ReleasePath] ----> |
+      |                             |                              |                           |
+      |                             |---[high watermark?]--------->|                           |
+      |                             |   memoryUsageRatio >= 150%?  |                           |
+      |                             |                              |                           |
+      |                             |                              | [droppable event?]        |
+      |                             |                              |   handler.OnDrop()        |
+      |                             |                              |                           |
+      |                             | <-----(release 完成)--------- |                           |
+      |                             |                              |                           |
+      |                             | [pendingQueue.PushBack]      |                           |
+      |                             | [updatePendingSize]          |                           |
+      |                             | [totalPendingSize.Add]       |                           |
+      |                             |                              |                           |
+      | <-----(append 完成)-------- |                              |                           |
+      |                             |                              |                           |
+
+注：deadlock 条件 = (5s 内有入队 && 5s 内无出队) && (memoryUsageRatio > 60%)
+注：high watermark 条件 = memoryUsageRatio >= 1.5 (150%)
+注：releaseMemory 目标释放量 = totalPendingSize * 40%
+```
 
 术语说明：可丢弃事件（[Droppable](#c-terminology)）
 - 含义：EventType.Droppable=true 的事件可被内存控制丢弃。
@@ -342,6 +408,44 @@ summary：说明 [ReleasePath](#c-terminology) 反馈从 EventCollector 下发�
 - dynstream 将 release 信号注入对应 stream。
 - handleLoop 识别 release 事件并调用 eventQueue.releasePath 清空该 [path](#c-terminology) 队列。
 - 清空后同步扣减 [area](#c-terminology)/[path](#c-terminology) 的 pendingSize，最终归零。
+
+时序图：
+```
+memControl                     EventCollector                  DynamicStream                    stream                      eventQueue
+    |                               |                               |                              |                              |
+    | --(ReleasePath feedback)----> |                               |                              |                              |
+    |   [path, FeedbackType]        |                               |                              |                              |
+    |                               |                               |                              |                              |
+    |                               | [processDSFeedback]           |                              |                              |
+    |                               |   feedbackType == ReleasePath?|                              |                              |
+    |                               |                               |                              |                              |
+    |                               | --(ds.Release(path))--------> |                              |                              |
+    |                               |                               |                              |                              |
+    |                               |                               | --(addEvent)---------------->|                              |
+    |                               |                               |   [release=true, pathInfo]   |                              |
+    |                               |                               |                              |                              |
+    |                               |                               |                              | [handleLoop 收到 release]    |
+    |                               |                               |                              |                              |
+    |                               |                               |                              | --(releasePath)------------> |
+    |                               |                               |                              |   [pathInfo]                 |
+    |                               |                               |                              |                              |
+    |                               |                               |                              |                              | [pendingQueue.PopFront]
+    |                               |                               |                              |                              | [逐个丢弃事件]
+    |                               |                               |                              |                              |
+    |                               |                               |                              |                              | [decPendingSize]
+    |                               |                               |                              |                              | [areaMemStat.totalPendingSize.Add(-size)]
+    |                               |                               |                              |                              | [path.pendingSize.Store(0)]
+    |                               |                               |                              |                              |
+    |                               |                               |                              | <----(release 完成)--------- |
+    |                               |                               |                              |                              |
+    |                               |                               | <----(Release 完成)---------- |                              |
+    |                               |                               |                              |                              |
+    |                               | <----(Release 完成)----------- |                              |                              |
+    |                               |                               |                              |                              |
+
+注：ReleasePath 是"丢弃/清空"操作，事件不会恢复，直接从 pendingQueue 移除。
+注：areaMemStat.totalPendingSize 同步扣减，确保内存统计准确。
+```
 
 调用链：
 - [EventCollector](#c-terminology) 接收 [ReleasePath](#c-terminology)
