@@ -1,4 +1,4 @@
-# Memory Controller 报告
+# Memory Controller 代码分析
 
 说明：以下按“入口 -> 逻辑 -> 最底层释放”的链路组织；每条记录包含 `文件:行号`、代码片段、说明。
 
@@ -39,7 +39,140 @@ summary：
 - **前置条件**
     - 新架构开关 [newarch](#c-terminology) 启用且 [EventCollector](#c-terminology) 正常运行（见第 2 节）。
 
-架构层次图：
+**总体架构图：**
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              业务层 (Business Layer)                                 │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐  │
+│  │  Changefeed (复制任务)                                                         │  │
+│  │  └── Dispatcher 1, Dispatcher 2, ... Dispatcher N (每个表一个)                  │  │
+│  └───────────────────────────────────────────────────────────────────────────────┘  │
+│                                        │                                            │
+│                                        │ EventCollector 映射                        │
+│                                        │   Changefeed → Area                        │
+│                                        │   Dispatcher → Path                        │
+│                                        ▼                                            │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           基础设施层 (Infrastructure Layer)                          │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐  │
+│  │  DynamicStream (通用事件处理框架)                                               │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────────┐  │  │
+│  │  │  memControl (内存控制器)                                                  │  │  │
+│  │  │    Area (对应 Changefeed)                                                │  │  │
+│  │  │    └── Path 1, Path 2, ... Path N (对应 Dispatcher)                      │  │  │
+│  │  │        每个 Path 有 pendingQueue + pendingSize                           │  │  │
+│  │  └─────────────────────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**总体数据流图：**
+```
+                              ┌──────────────┐
+                              │EventService  │
+                              │ (上游事件源)  │
+                              └──────┬───────┘
+                                     │ send events
+                                     ▼
+┌──────────────┐              ┌──────────────┐              ┌──────────────┐
+│DispatcherMgr │              │EventCollector│              │DynamicStream │
+│              │              │  (业务组件)   │              │  (通用框架)   │
+│              │              │              │              │              │
+└──────┬───────┘              └──────┬───────┘              └──────┬───────┘
+       │                             │                             │
+       │ MemoryQuota                 │                             │
+       └────────────────────────────>│                             │
+                                     │                             │
+                                     │ AddDispatcher + quota       │
+                                     ├────────────────────────────>│
+                                     │                             │
+                                     │                             │ ──┐
+                                     │                             │   │ memControl
+                                     │                             │   │ - 统计 pending
+                                     │                             │   │ - 检测 deadlock
+                                     │                             │   │ - 触发释放
+                                     │                             │ <─┘
+                                     │                             │
+                                     │<──── ReleasePath feedback ──│
+                                     │                             │
+                                     │ ds.Release(path)            │
+                                     ├────────────────────────────>│
+                                     │                             │
+                                     │                             │ ──> 清空 pendingQueue
+                                     │                             │     扣减 pendingSize
+                                     │                             │
+                                     │                             ▼
+                                     │                      ┌──────────────┐
+                                     │                      │  Dispatcher  │
+                                     │                      │  (处理事件)   │
+                                     │                      │  写入下游     │
+                                     │                      └──────────────┘
+```
+
+**关键阈值速查表：**
+| 阈值 | 值 | 说明 |
+|------|-----|------|
+| deadlock 窗口 | 5s | 有入队 && 无出队 |
+| deadlock 高水位 | 60% | memoryUsageRatio > 60% |
+| 高水位强制释放 | 150% | memoryUsageRatio >= 150% |
+| 释放比例 | 40% | totalPendingSize * 40% |
+| 释放最小阈值 | 256 bytes | pendingSize >= 256 |
+
+---
+
+<a id="sec-1-memory-quota"></a>
+### 1 配额来源与可配置入口【业务层】
+
+summary：说明 [MemoryQuota](#c-terminology) 的来源（默认值、配置入口）与 dynstream 兜底默认值。要点如下：
+- MemoryQuota 在 cdc 启动阶段就作为配置项引入/校验。
+- 真正生效（作为 [area](#c-terminology) 的上限）是在 changefeed 注册到 [EventCollector](#c-terminology) 时（见第 3 节）。
+- dynstream 对未设置的 area 也有 1GB 的默认兜底。
+
+#### 1.1 默认值
+```golang
+// pkg/config/server.go:45
+DefaultChangefeedMemoryQuota = 1024 * 1024 * 1024 // changefeed 默认内存配额为 1GB
+// pkg/config/replica_config.go:47
+MemoryQuota: util.AddressOf(uint64(DefaultChangefeedMemoryQuota)) // ReplicaConfig 默认把 MemoryQuota 设为 1GB
+```
+
+#### 1.2 可配置字段
+```golang
+// pkg/config/replica_config.go:145
+MemoryQuota *uint64 `toml:"memory-quota"` // changefeed 的 TOML 配置键名为 memory-quota
+// pkg/config/changefeed.go:193
+MemoryQuota uint64 `toml:"memory-quota"` // ChangefeedConfig 内部保存内存配额（单位字节）
+```
+
+#### 1.3 CLI/配置文件入口
+```golang
+// cmd/cdc/cli/cli_changefeed_create.go:64
+cmd.PersistentFlags().StringVar(&o.configFile, "config", "", "Path of the configuration file") // 创建 changefeed 时通过 --config 指定配置文件
+```
+
+#### 1.4 仓库内示例（TOML 片段）
+```golang
+// cmd/config-converter/main_test.go:39
+memory-quota = 100 // 测试用 TOML 示例，展示键名与格式
+```
+
+#### 1.5 dynstream 默认兜底（当 AreaSettings 未设置或 size<=0）
+```golang
+// utils/dynstream/interfaces.go:203
+DefaultMaxPendingSize = uint64(1024 * 1024 * 1024) // dynstream 默认的最大待处理内存 1GB
+// utils/dynstream/interfaces.go:257
+s.maxPendingSize = DefaultMaxPendingSize // AreaSettings.fix() 在 size<=0 时回退到默认值
+```
+
+---
+
+<a id="sec-2-enable-memory-control"></a>
+### 2 新架构入口：EventCollector 启用 memory control【业务层】
+
+summary：说明"是否必然启用 [memory controller](#c-terminology)"的判断链路。要点如下：
+
+**架构层次图：**
 ```
 ╔═════════════════════════════════════════════════════════════════════════════════════════════════╗
 ║                                        业务层 (Business Layer)                                   ║
@@ -111,7 +244,105 @@ summary：
 └─────────────────┴──────────────────────────────────────────────────────────────────┘
 ```
 
-时序图（完整流程）：
+**EventCollector 与 memory controller 的关系：**
+```
+┌─────────────────────────────────────────────────────────────┐
+│  EventCollector (业务组件)                                   │
+│  ├── 职责：事件路由、Dispatcher 管理                          │
+│  │                                                          │
+│  │   ┌─────────────────────────────────────────────────┐   │
+│  │   │  DynamicStream (通用框架)                        │   │
+│  │   │  ├── 职责：事件队列、并行处理                      │   │
+│  │   │  │                                              │   │
+│  │   │  │   ┌─────────────────────────────────────┐   │   │
+│  │   │  │   │  memory controller (子模块)          │   │   │
+│  │   │  │   │  ├── 职责：内存统计、阈值检测、释放    │   │   │
+│  │   │  │   │  └─────────────────────────────────────┘   │   │
+│  │   │  │                                              │   │
+│  │   │  └─────────────────────────────────────────────┘   │
+│  │                                                          │
+│  └──────────────────────────────────────────────────────────┘
+
+注：EventCollector 不直接操作 memory controller，只和 DynamicStream 交互。
+   memory controller 是 DynamicStream 的内部实现细节。
+```
+
+要点如下：
+- [newarch](#c-terminology)=true 时进入新架构 server。
+- 新架构会启动 [EventCollector](#c-terminology)。
+- EventCollector 动态流硬编码启用 EnableMemoryControl。
+
+调用链：
+- 新架构开关（[newarch](#c-terminology)）
+ - newarch=true 时进入新架构 server
+  - setPreServices 创建 [EventCollector](#c-terminology)
+   - [EventCollector](#c-terminology) 动态流启用 EnableMemoryControl
+
+重要结论：**新架构必然启用 [memory controller](#c-terminology)**（EventCollector 动态流硬编码 `EnableMemoryControl=true`）。
+
+#### 2.1 新架构开关与入口（是否必然启用 EventCollector）
+```golang
+// pkg/config/server.go:91
+Newarch:    false // newarch 默认关闭
+// cmd/cdc/server/server.go:67
+cmd.Flags().BoolVarP(&o.serverConfig.Newarch, "newarch", "x", o.serverConfig.Newarch, "Run the new architecture of TiCDC server") // CLI 开关
+// cmd/cdc/server/server.go:301
+newarch = os.Getenv("TICDC_NEWARCH") == "true" // 环境变量开关
+// cmd/cdc/server/server.go:281
+newarch = isNewArchEnabledByConfig(serverConfigFilePath) // 读取 server 配置文件的 newarch
+// cmd/cdc/server/server.go:368
+if isNewArchEnabled(o) { // newarch=true -> 新架构
+// cmd/cdc/server/server.go:378
+err = o.run(cmd) // 进入新架构 server 运行流程
+// cmd/cdc/server/server.go:382
+return runTiFlowServer(o, cmd) // newarch=false -> 旧架构流程
+```
+
+#### 2.2 新架构下 EventCollector 与 memory control（是否必然启用）
+```golang
+// server/server.go:259
+ec := eventcollector.New(c.info.ID) // 新架构 preServices 中创建 EventCollector
+// server/server.go:261
+ec.Run(ctx) // 启动 EventCollector
+// downstreamadapter/eventcollector/helper.go:26
+option := dynstream.NewOption() // 创建 dynstream 运行参数
+// downstreamadapter/eventcollector/helper.go:30
+option.EnableMemoryControl = true // EventCollector 动态流硬编码开启 memory control
+// utils/dynstream/interfaces.go:217
+EnableMemoryControl bool // memory control 默认关闭，需显式开启
+// utils/dynstream/parallel_dynamic_stream.go:72
+if option.EnableMemoryControl { // 判断是否启用 memory control
+// utils/dynstream/parallel_dynamic_stream.go:74
+s.feedbackChan = make(chan Feedback[A, P, D], 1024) // 创建内存控制反馈通道
+// utils/dynstream/parallel_dynamic_stream.go:75
+s.memControl = newMemControl[A, P, T, D, H]() // 初始化内存控制器实例
+```
+
+#### 2.3 memory control 算法选择（配置项/硬编码）
+
+summary：说明 [memory controller](#c-terminology) 算法的选择与配置。要点如下：
+- 算法类型只有两种：[MemoryControlForPuller](#c-terminology) 与 [MemoryControlForEventCollector](#c-terminology)。
+- 当前没有用户可配置项；EventCollector 在创建 AreaSettings 时硬编码为 MemoryControlForEventCollector。
+- 默认情况：新架构 [EventCollector](#c-terminology) 使用 MemoryControlForEventCollector；NewMemoryControlAlgorithm 在未指定为 EventCollector 算法时默认走 [Puller](#c-terminology) 算法。
+
+```golang
+// utils/dynstream/memory_control.go:28-34
+MemoryControlForPuller = 0 // Puller 算法常量
+MemoryControlForEventCollector = 1 // EventCollector 算法常量
+// utils/dynstream/interfaces.go:274
+algorithm: memoryControlAlgorithm // AreaSettings 保存算法类型
+// downstreamadapter/eventcollector/event_collector.go:270
+areaSetting := dynstream.NewAreaSettingsWithMaxPendingSize(memoryQuota, dynstream.MemoryControlForEventCollector, "eventCollector") // EventCollector 硬编码算法
+// utils/dynstream/memory_control_algorithm.go:30-35
+switch algorithm {
+case MemoryControlForEventCollector:
+  return &EventCollectorMemoryControl{}
+default:
+  return &PullerMemoryControl{} // 未指定时默认 Puller
+}
+```
+
+**完整时序图：**
 ```
                                     ╔═════════════════════════════════════════════════════════════════════════════════╗
                                     ║                        Phase 1: 初始化与配额绑定                              ║
@@ -212,134 +443,10 @@ feedbackChan                    EventCollector                 DynamicStream    
 └─────────────────────┴───────────────────────────────────────────────────────────────────┘
 ```
 
-<a id="sec-1-memory-quota"></a>
-### 1 配额来源与可配置入口
-
-summary：说明 [MemoryQuota](#c-terminology) 的来源（默认值、配置入口）与 dynstream 兜底默认值。要点如下：
-- MemoryQuota 在 cdc 启动阶段就作为配置项引入/校验。
-- 真正生效（作为 [area](#c-terminology) 的上限）是在 changefeed 注册到 [EventCollector](#c-terminology) 时（见第 3 节）。
-- dynstream 对未设置的 area 也有 1GB 的默认兜底。
-
-#### 1.1 默认值
-```golang
-// pkg/config/server.go:45
-DefaultChangefeedMemoryQuota = 1024 * 1024 * 1024 // changefeed 默认内存配额为 1GB
-// pkg/config/replica_config.go:47
-MemoryQuota: util.AddressOf(uint64(DefaultChangefeedMemoryQuota)) // ReplicaConfig 默认把 MemoryQuota 设为 1GB
-```
-
-#### 1.2 可配置字段
-```golang
-// pkg/config/replica_config.go:145
-MemoryQuota *uint64 `toml:"memory-quota"` // changefeed 的 TOML 配置键名为 memory-quota
-// pkg/config/changefeed.go:193
-MemoryQuota uint64 `toml:"memory-quota"` // ChangefeedConfig 内部保存内存配额（单位字节）
-```
-
-#### 1.3 CLI/配置文件入口
-```golang
-// cmd/cdc/cli/cli_changefeed_create.go:64
-cmd.PersistentFlags().StringVar(&o.configFile, "config", "", "Path of the configuration file") // 创建 changefeed 时通过 --config 指定配置文件
-```
-
-#### 1.4 仓库内示例（TOML 片段）
-```golang
-// cmd/config-converter/main_test.go:39
-memory-quota = 100 // 测试用 TOML 示例，展示键名与格式
-```
-
-#### 1.5 dynstream 默认兜底（当 AreaSettings 未设置或 size<=0）
-```golang
-// utils/dynstream/interfaces.go:203
-DefaultMaxPendingSize = uint64(1024 * 1024 * 1024) // dynstream 默认的最大待处理内存 1GB
-// utils/dynstream/interfaces.go:257
-s.maxPendingSize = DefaultMaxPendingSize // AreaSettings.fix() 在 size<=0 时回退到默认值
-```
-
----
-
-<a id="sec-2-enable-memory-control"></a>
-### 2 新架构入口：EventCollector 启用 memory control
-
-summary：说明“是否必然启用 [memory controller](#c-terminology)”的判断链路。要点如下：
-- [newarch](#c-terminology)=true 时进入新架构 server。
-- 新架构会启动 [EventCollector](#c-terminology)。
-- EventCollector 动态流硬编码启用 EnableMemoryControl。
-
-调用链：
-- 新架构开关（[newarch](#c-terminology)）
- - newarch=true 时进入新架构 server
-  - setPreServices 创建 [EventCollector](#c-terminology)
-   - [EventCollector](#c-terminology) 动态流启用 EnableMemoryControl
-
-重要结论：**新架构必然启用 [memory controller](#c-terminology)**（EventCollector 动态流硬编码 `EnableMemoryControl=true`）。
-
-#### 2.1 新架构开关与入口（是否必然启用 EventCollector）
-```golang
-// pkg/config/server.go:91
-Newarch:    false // newarch 默认关闭
-// cmd/cdc/server/server.go:67
-cmd.Flags().BoolVarP(&o.serverConfig.Newarch, "newarch", "x", o.serverConfig.Newarch, "Run the new architecture of TiCDC server") // CLI 开关
-// cmd/cdc/server/server.go:301
-newarch = os.Getenv("TICDC_NEWARCH") == "true" // 环境变量开关
-// cmd/cdc/server/server.go:281
-newarch = isNewArchEnabledByConfig(serverConfigFilePath) // 读取 server 配置文件的 newarch
-// cmd/cdc/server/server.go:368
-if isNewArchEnabled(o) { // newarch=true -> 新架构
-// cmd/cdc/server/server.go:378
-err = o.run(cmd) // 进入新架构 server 运行流程
-// cmd/cdc/server/server.go:382
-return runTiFlowServer(o, cmd) // newarch=false -> 旧架构流程
-```
-
-#### 2.2 新架构下 EventCollector 与 memory control（是否必然启用）
-```golang
-// server/server.go:259
-ec := eventcollector.New(c.info.ID) // 新架构 preServices 中创建 EventCollector
-// server/server.go:261
-ec.Run(ctx) // 启动 EventCollector
-// downstreamadapter/eventcollector/helper.go:26
-option := dynstream.NewOption() // 创建 dynstream 运行参数
-// downstreamadapter/eventcollector/helper.go:30
-option.EnableMemoryControl = true // EventCollector 动态流硬编码开启 memory control
-// utils/dynstream/interfaces.go:217
-EnableMemoryControl bool // memory control 默认关闭，需显式开启
-// utils/dynstream/parallel_dynamic_stream.go:72
-if option.EnableMemoryControl { // 判断是否启用 memory control
-// utils/dynstream/parallel_dynamic_stream.go:74
-s.feedbackChan = make(chan Feedback[A, P, D], 1024) // 创建内存控制反馈通道
-// utils/dynstream/parallel_dynamic_stream.go:75
-s.memControl = newMemControl[A, P, T, D, H]() // 初始化内存控制器实例
-```
-
-#### 2.3 memory control 算法选择（配置项/硬编码）
-
-summary：说明 [memory controller](#c-terminology) 算法的选择与配置。要点如下：
-- 算法类型只有两种：[MemoryControlForPuller](#c-terminology) 与 [MemoryControlForEventCollector](#c-terminology)。
-- 当前没有用户可配置项；EventCollector 在创建 AreaSettings 时硬编码为 MemoryControlForEventCollector。
-- 默认情况：新架构 [EventCollector](#c-terminology) 使用 MemoryControlForEventCollector；NewMemoryControlAlgorithm 在未指定为 EventCollector 算法时默认走 [Puller](#c-terminology) 算法。
-
-```golang
-// utils/dynstream/memory_control.go:28-34
-MemoryControlForPuller = 0 // Puller 算法常量
-MemoryControlForEventCollector = 1 // EventCollector 算法常量
-// utils/dynstream/interfaces.go:274
-algorithm: memoryControlAlgorithm // AreaSettings 保存算法类型
-// downstreamadapter/eventcollector/event_collector.go:270
-areaSetting := dynstream.NewAreaSettingsWithMaxPendingSize(memoryQuota, dynstream.MemoryControlForEventCollector, "eventCollector") // EventCollector 硬编码算法
-// utils/dynstream/memory_control_algorithm.go:30-35
-switch algorithm {
-case MemoryControlForEventCollector:
-  return &EventCollectorMemoryControl{}
-default:
-  return &PullerMemoryControl{} // 未指定时默认 Puller
-}
-```
-
 ---
 
 <a id="sec-3-quota-area"></a>
-### 3 changefeed 配额绑定到 AreaSettings（changefeed -> dispatcher -> dynstream）
+### 3 changefeed 配额绑定到 AreaSettings【业务层 + 基础设施层】
 
 summary：说明在注册 changefeed/dispatcher 时，MemoryQuota 被传入 dynstream，成为 area 的上限。要点如下：
 - DispatcherManager 从 changefeed 配置读 MemoryQuota。
@@ -370,7 +477,7 @@ algorithm: memoryControlAlgorithm // 记录使用的内存控制算法类型
 ---
 
 <a id="sec-4-add-path-area"></a>
-### 4 dynstream 把 path 加入 area 并挂上 memControl
+### 4 dynstream 把 path 加入 area 并挂上 memControl【基础设施层】
 
 summary：说明 dynstream 内部如何把 [path](#c-terminology) 归入 [area](#c-terminology)，并绑定 memControl。要点如下：
 - AddPath 触发 setMemControl。
@@ -431,7 +538,7 @@ area.settings.Store(&settings) // 保存 area 的内存上限与算法设置
 ---
 
 <a id="sec-5-core-control"></a>
-### 5 内存统计与控制核心（append/ratio/释放）
+### 5 内存统计与控制核心（append/ratio/释放）【基础设施层】
 
 summary：说明事件入队时的内存统计、阈值判定、死锁检测与释放策略（核心控制逻辑）。结构化说明如下：
 - **入队前处理（入队到 path 队列前）**
@@ -562,7 +669,7 @@ PeriodicSignal
 ---
 
 <a id="sec-6-releasepath-flow"></a>
-### 6 ReleasePath 反馈执行链（从入口到最底层）
+### 6 ReleasePath 反馈执行链（从入口到最底层）【基础设施层】
 
 summary：说明 [ReleasePath](#c-terminology) 反馈从 EventCollector 下发到 dynstream 清空队列的完整执行链路。关键步骤如下：
 - EventCollector 的 processDSFeedback 仅处理 ReleasePath（分别来自 ds 与 redoDs）。
