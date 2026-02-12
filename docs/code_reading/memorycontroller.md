@@ -39,16 +39,105 @@ summary：
 - **前置条件**
     - 新架构开关 [newarch](#c-terminology) 启用且 [EventCollector](#c-terminology) 正常运行（见第 2 节）。
 
-时序图（简化）：
+时序图（完整流程）：
 ```
-DispatcherManager --(MemoryQuota)--> EventCollector --(AddDispatcher)--> dynstream(area/path)
-   |                                                          |
-   |                          appendEvent                     v
-   +-----------------------------------------------------> memory control
-                                                            |
-                                                            | releaseMemory
-                                                            v
-EventCollector <-(ReleasePath feedback)- dynstream <-(release)- eventQueue
+                                    ╔═════════════════════════════════════════════════════════════════════════════════╗
+                                    ║                        Phase 1: 初始化与配额绑定                              ║
+                                    ╚═════════════════════════════════════════════════════════════════════════════════╝
+
+DispatcherManager               EventCollector                DynamicStream                 memControl                areaMemStat
+      |                              |                             |                            |                           |
+      | --(MemoryQuota)------------> |                             |                            |                           |
+      |                              |                             |                            |                           |
+      |                              | --(AddDispatcher)---------> |                            |                           |
+      |                              |   [dispatcher, quota]       |                            |                           |
+      |                              |                             |                            |                           |
+      |                              |                             | --(AddPath)--------------> |                           |
+      |                              |                             |   [path, AreaSettings]     |                           |
+      |                              |                             |                            |                           |
+      |                              |                             |                            | --(addPathToArea)-------> |
+      |                              |                             |                            |   [创建/复用 area]        |
+      |                              |                             |                            |                           |
+      |                              |                             |                            | <---(areaMemStat)-------- |
+      |                              |                             |                            |   [绑定 path.areaMemStat] |
+      |                              |                             |                            |                           |
+      |                              |                             | <----(path 绑定完成)------- |                           |
+      |                              |                             |                            |                           |
+
+                                    ╔═════════════════════════════════════════════════════════════════════════════════╗
+                                    ║                        Phase 2: 事件入队与内存检测                           ║
+                                    ╚═════════════════════════════════════════════════════════════════════════════════╝
+
+EventService                    DynamicStream                  areaMemStat                 releaseMemory              feedbackChan
+      |                              |                             |                            |                           |
+      | --(send events)------------> |                             |                            |                           |
+      |                              |                             |                            |                           |
+      |                              | --(appendEvent)-----------> |                            |                           |
+      |                              |   [event, handler]          |                            |                           |
+      |                              |                             |                            |                           |
+      |                              |                             | [checkDeadlock]            |                           |
+      |                              |                             |   有入队 && 无出队?         |                           |
+      |                              |                             |   memoryUsageRatio > 60%?  |                           |
+      |                              |                             |                            |                           |
+      |                              |                             | ===[deadlock 检测通过]====> |                           |
+      |                              |                             |                            |                           |
+      |                              |                             |                            | [选择 blocking path]      |
+      |                              |                             |                            | [按 lastHandleEventTs     |
+      |                              |                             |                            |  降序排序]                 |
+      |                              |                             |                            |                           |
+      |                              |                             |                            | --(ReleasePath)---------> |
+      |                              |                             |                            |   [path, FeedbackType]    |
+      |                              |                             |                            |                           |
+      |                              |                             |                            | [droppable?]              |
+      |                              |                             |                            |   handler.OnDrop()        |
+      |                              |                             |                            |                           |
+      |                              |                             | <----(release 完成)-------- |                           |
+      |                              |                             |                            |                           |
+      |                              |                             | [pendingQueue.PushBack]    |                           |
+      |                              |                             | [updatePendingSize]        |                           |
+      |                              |                             | [totalPendingSize.Add]     |                           |
+      |                              |                             |                            |                           |
+
+                                    ╔═════════════════════════════════════════════════════════════════════════════════╗
+                                    ║                        Phase 3: ReleasePath 反馈清空                         ║
+                                    ╚═════════════════════════════════════════════════════════════════════════════════╝
+
+feedbackChan                    EventCollector                 DynamicStream                  stream                   eventQueue
+      |                              |                             |                            |                           |
+      | --(ReleasePath)------------> |                             |                            |                           |
+      |                              |                             |                            |                           |
+      |                              | [processDSFeedback]         |                            |                           |
+      |                              |                             |                            |                           |
+      |                              | --(ds.Release(path))------> |                            |                           |
+      |                              |                             |                            |                           |
+      |                              |                             | --(addEvent)-------------> |                           |
+      |                              |                             |   [release=true, pathInfo] |                           |
+      |                              |                             |                            |                           |
+      |                              |                             |                            | [handleLoop]              |
+      |                              |                             |                            |                           |
+      |                              |                             |                            | --(releasePath)--------> |
+      |                              |                             |                            |   [pathInfo]              |
+      |                              |                             |                            |                           |
+      |                              |                             |                            |                           | [PopFront 逐个丢弃]
+      |                              |                             |                            |                           | [decPendingSize]
+      |                              |                             |                            |                           | [totalPendingSize.Add(-size)]
+      |                              |                             |                            |                           | [pendingSize.Store(0)]
+      |                              |                             |                            |                           |
+      |                              |                             |                            | <----(完成)-------------- |
+      |                              |                             | <----(完成)--------------- |                           |
+      |                              | <----(完成)---------------- |                            |                           |
+      |                              |                             |                            |                           |
+
+关键阈值说明：
+┌─────────────────────┬───────────────────────────────────────────────────────────────────┐
+│ 阈值名称            │ 说明                                                              │
+├─────────────────────┼───────────────────────────────────────────────────────────────────┤
+│ deadlock 窗口       │ 5s 内有入队 && 5s 内无出队                                        │
+│ deadlock 高水位     │ memoryUsageRatio > 60% (1 - defaultReleaseMemoryRatio)           │
+│ 高水位强制释放      │ memoryUsageRatio >= 150%                                          │
+│ 释放比例            │ totalPendingSize * 40% (defaultReleaseMemoryRatio)               │
+│ 释放最小阈值        │ pendingSize >= 256 (defaultReleaseMemoryThreshold)               │
+└─────────────────────┴───────────────────────────────────────────────────────────────────┘
 ```
 
 <a id="sec-1-memory-quota"></a>
