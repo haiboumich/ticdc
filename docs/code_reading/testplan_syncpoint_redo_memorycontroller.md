@@ -164,6 +164,20 @@ summary：
 - 判定以“lag 曲线 + memory 控制行为 + redo 进度”综合判断
   - 需要记录对照组（syncpoint off / redo off）
 
+<a id="sec-f1-criteria"></a>
+### F.1 量化判定（草案）
+
+summary：
+- 阈值需先跑基线并校准（硬件/负载/版本差异会显著影响）
+  - 下表为初始占位，需按实际环境调整
+
+| 指标 | 参考阈值（需基线校准） | 说明 |
+|------|------------------------|------|
+| Lag 增长斜率 | 30min 移动窗口内接近 0（或 < 100KB/s） | 关注“持续单调上升”而非短时抖动 |
+| Skip-scan 比例 | 持续 < 5%（或不高于基线 + 3%） | 与 EventService scan 行为关联 |
+| DynamicStream memory | 稳定在配额 ±10% | 不出现持续爬升或锯齿式增长 |
+| redoGlobalTs lag | 长期 < 1s（或不高于基线 + 0.5s） | redo 追赶能力的直观指标 |
+
 示例判定（草案）：
 - 通过：lag 在稳定区间内波动，skip-scan 可解释且不持续上升
 - 失败：lag 持续单调上升，或 redoGlobalTs 长期停滞

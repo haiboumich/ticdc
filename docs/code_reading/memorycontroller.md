@@ -345,6 +345,22 @@ summary：对比新架构（EventCollector 算法，见[术语汇总小节](#c-t
 - EventCollector 算法不触发 area pause/resume（仅计算比例）。
 - Puller 算法有固定阈值：path 20/10，area 80/50。
 
+#### 7.1 Pause/Resume 与 ReleasePath 对比
+
+summary：
+- Puller 算法通过 pause/resume 抑制 path/area 入队
+- EventCollector 算法不 pause/resume，而是通过 ReleasePath 清理 pending 队列
+- ReleasePath 是“丢弃/清空”，不是“暂停”
+
+| 维度 | Puller 算法（Pause/Resume） | EventCollector 算法（ReleasePath） |
+|------|----------------------------|------------------------------------|
+| 触发条件 | path/area 达到固定比例阈值 | deadlock 或高水位触发 releaseMemory |
+| 动作 | pause/resume 反馈，阻止/恢复入队 | ReleasePath 反馈，清空 path 待处理事件 |
+| 结果 | pending 不再增长，但历史事件保留 | pending 直接下降，事件被丢弃 |
+| 适用算法 | MemoryControlForPuller | MemoryControlForEventCollector |
+
+说明：ReleasePath 的执行链路见第 6 节（ReleasePath 反馈执行链）。
+
 调用链：
 - areaMemStat.updateAreaPauseState
   - algorithm.ShouldPauseArea

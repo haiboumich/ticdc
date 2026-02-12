@@ -219,6 +219,7 @@ manager.sinkQuota = totalQuota - manager.redoQuota
 summary：
 - redoGlobalTs（见[术语汇总小节](#c-terminology)）落后时主链路事件缓存
   - 缓存不在 DynamicStream 队列内，需关注内存占用与 lag
+- redoGlobalTs 的更新链路见 `docs/code_reading/redo.md` A.6.1
 
 ```golang
 // downstreamadapter/dispatcher/event_dispatcher.go:135-142

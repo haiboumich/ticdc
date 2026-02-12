@@ -10,6 +10,8 @@
   - [A.4 Redo Sink 写入流程（DDL/DML）](#sec-a4-sink)
   - [A.5 Redo Meta 维护与上报](#sec-a5-meta)
   - [A.6 Redo 与主链路的进度耦合（redoGlobalTs）](#sec-a6-coupling)
+  - [A.6.1 redoGlobalTs 更新链路（RedoMeta -> Maintainer -> DispatcherManager）](#sec-a6-1-update)
+  - [A.6.2 缓存与回放细节（cacheEvents）](#sec-a6-2-cache)
   - [A.7 Redo 事件路由（EventService -> EventCollector）](#sec-a7-routing)
 - [B. 可配置项说明](#sec-b-config)
 - [C. 术语汇总小节](#c-terminology)
@@ -186,6 +188,8 @@ err := mc.SendCommand(
 summary：
 - redoGlobalTs（见[术语汇总小节](#c-terminology)）落后时，主链路事件会被缓存
   - 直到 redo 追上才继续 handleEvents
+- redoGlobalTs 的更新来自 RedoMeta 上报并经 Maintainer 广播
+  - 更新后会触发 EventDispatcher 回放缓存事件
 
 ```golang
 // downstreamadapter/dispatcher/event_dispatcher.go:135-142
@@ -195,6 +199,109 @@ if d.redoEnable && len(dispatcherEvents) > 0 && d.redoGlobalTs.Load() < dispatch
 }
 ```
 说明：redoGlobalTs（见[术语汇总小节](#c-terminology)）用于限制主链路前进，保证 redo 先行落盘。
+
+<a id="sec-a6-1-update"></a>
+#### A.6.1 redoGlobalTs 更新链路（RedoMeta -> Maintainer -> DispatcherManager）
+
+summary：
+- redoGlobalTs 由 table-trigger redo dispatcher 的 RedoMeta resolvedTs 驱动
+  - DispatcherManager.collectRedoMeta 周期上报 RedoResolvedTsProgressMessage
+- Maintainer.onRedoPersisted 广播 RedoResolvedTsForwardMessage 到 HeartbeatCollector
+  - Handler 更新 redoGlobalTs，并触发所有 EventDispatcher.HandleCacheEvents
+
+调用链（主干）：
+- RedoDispatcher.GetFlushedMeta
+  - DispatcherManager.collectRedoMeta -> RedoResolvedTsProgressMessage
+    - Maintainer.onRedoPersisted -> RedoResolvedTsForwardMessage
+      - HeartBeatCollector.RecvMessages -> redoResolvedTsForwardMessageDynamicStream
+        - RedoResolvedTsForwardMessageHandler.Handle -> SetRedoResolvedTs -> HandleCacheEvents
+
+```golang
+// downstreamadapter/dispatchermanager/dispatcher_manager_redo.go:285-311 (func collectRedoMeta)
+logMeta := e.GetTableTriggerRedoDispatcher().GetFlushedMeta()
+...
+err := mc.SendCommand(
+    messaging.NewSingleTargetMessage(
+        e.GetMaintainerID(),
+        messaging.MaintainerManagerTopic,
+        &heartbeatpb.RedoResolvedTsProgressMessage{
+            ChangefeedID: e.changefeedID.ToPB(),
+            ResolvedTs:   logMeta.ResolvedTs,
+        },
+    ))
+```
+
+```golang
+// maintainer/maintainer.go:524-535 (func onRedoPersisted)
+if m.redoResolvedTs < req.ResolvedTs {
+    m.redoResolvedTs = req.ResolvedTs
+    for _, id := range m.bootstrapper.GetAllNodeIDs() {
+        msgs = append(msgs, messaging.NewSingleTargetMessage(
+            id, messaging.HeartbeatCollectorTopic,
+            &heartbeatpb.RedoResolvedTsForwardMessage{ChangefeedID: req.ChangefeedID, ResolvedTs: m.redoResolvedTs},
+        ))
+    }
+    m.sendMessages(msgs)
+}
+```
+
+```golang
+// downstreamadapter/dispatchermanager/helper.go:658-668 (func (*RedoResolvedTsForwardMessageHandler).Handle)
+ok := dispatcherManager.SetRedoResolvedTs(msg.ResolvedTs)
+if ok {
+    dispatcherManager.dispatcherMap.ForEach(func(id common.DispatcherID, dispatcher *dispatcher.EventDispatcher) {
+        dispatcher.HandleCacheEvents()
+    })
+}
+```
+
+```golang
+// downstreamadapter/dispatchermanager/dispatcher_manager_redo.go:281-282 (func SetRedoResolvedTs)
+return util.CompareAndMonotonicIncrease(&e.redoGlobalTs, resolvedTs)
+```
+
+<a id="sec-a6-2-cache"></a>
+#### A.6.2 缓存与回放细节（cacheEvents）
+
+summary：
+- 缓存落在 EventDispatcher.cacheEvents（容量=1 的 channel）
+  - 为避免动态流回收切片，cache 会复制 dispatcherEvents
+- redoGlobalTs 更新后调用 HandleCacheEvents
+  - 从缓存取出并重新执行 HandleEvents，解除阻塞后唤醒 wakeCallback
+
+```golang
+// downstreamadapter/dispatcher/event_dispatcher.go:34-48 (type EventDispatcher)
+// cacheEvents is used to store events with a commit-ts greater than redoGlobalTs
+cacheEvents struct {
+    sync.Mutex
+    events chan cacheEvents
+}
+```
+
+```golang
+// downstreamadapter/dispatcher/event_dispatcher.go:92-105 (func HandleCacheEvents)
+select {
+case cacheEvents, ok := <-d.cacheEvents.events:
+    if !ok { return }
+    block := d.HandleEvents(cacheEvents.events, cacheEvents.wakeCallback)
+    if !block { cacheEvents.wakeCallback() }
+default:
+}
+```
+
+```golang
+// downstreamadapter/dispatcher/event_dispatcher.go:107-121 (func cache)
+cacheEvents := cacheEvents{
+    events:       append(make([]DispatcherEvent, 0, len(dispatcherEvents)), dispatcherEvents...),
+    wakeCallback: wakeCallback,
+}
+select {
+case d.cacheEvents.events <- cacheEvents:
+    ...
+default:
+    log.Panic("dispatcher cache events is full", ...)
+}
+```
 
 <a id="sec-a7-routing"></a>
 ### A.7 Redo 事件路由（EventService -> EventCollector）
