@@ -590,6 +590,90 @@ path.appendEvent                areaMemStat                    releaseMemory    
 注：releaseMemory 目标释放量 = totalPendingSize * 40%
 ```
 
+**releaseMemory 详细流程与 path 选择算法：**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  Step 1: memory control 分析判断（在 DynamicStream 内部）                             │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  areaMemStat.releaseMemory()                                                        │
+│  │                                                                                  │
+│  ├── 1. 计算目标释放量                                                              │
+│  │   sizeToRelease = totalPendingSize * 40%                                         │
+│  │                                                                                  │
+│  ├── 2. 按 lastHandleEventTs 降序排序所有 paths                                      │
+│  │   // 越久没处理的 path 越优先释放（可能是卡住的）                                   │
+│  │   sort.Slice(paths, func(i, j int) bool {                                        │
+│  │       return paths[i].lastHandleEventTs > paths[j].lastHandleEventTs              │
+│  │   })                                                                             │
+│  │                                                                                  │
+│  ├── 3. 筛选符合条件的 paths                                                         │
+│  │   条件：blocking=true && pendingSize >= 256                                       │
+│  │   // 只释放阻塞中的且有一定数据量的 path                                          │
+│  │                                                                                  │
+│  ├── 4. 选择 paths 直到达到目标释放量                                                 │
+│  │   for _, path := range paths {                                                   │
+│  │       if releasedSize >= sizeToRelease { break }                                  │
+│  │       releasedPaths = append(releasedPaths, path)                                 │
+│  │       releasedSize += path.pendingSize                                            │
+│  │   }                                                                              │
+│  │                                                                                  │
+│  └── 5. 发送 ReleasePath feedback                                                    │
+│      for _, path := range releasedPaths {                                           │
+│          feedbackChan <- Feedback{Path: path.path, FeedbackType: ReleasePath}       │
+│      }                                                                              │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                                         │
+                                         ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  Step 2: EventCollector 接收 feedback（转发者，不是执行者）                            │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  // event_collector.go:422-425                                                      │
+│  case feedback := <-c.ds.Feedback():                                                │
+│      if feedback.FeedbackType == dynstream.ReleasePath {                            │
+│          log.Info("release dispatcher memory...", dispatcherID)                     │
+│          c.ds.Release(feedback.Path)   // 只是转发，调用 DynamicStream.Release       │
+│      }                                                                              │
+│                                                                                     │
+│  注：EventCollector 管理 ds 和 redoDs 两个 DynamicStream，统一处理 feedback          │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                                         │
+                                         ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  Step 3: DynamicStream 执行 Release（真正的执行者）                                    │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  DynamicStream.Release(path)                                                        │
+│  └── stream.addEvent(release=true, pathInfo)  // 注入 release 信号                   │
+│                                                                                     │
+│  stream.handleLoop() 收到 release 信号                                               │
+│  └── eventQueue.releasePath(pathInfo)                                               │
+│      ├── pendingQueue.PopFront() 逐个丢弃事件                                        │
+│      ├── areaMemStat.decPendingSize(path, size)  // 扣减 area 统计                   │
+│      └── path.pendingSize.Store(0)  // path 统计清零                                 │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**常见误解澄清：**
+
+| 误解 | 实际 |
+|------|------|
+| EventCollector 直接清空队列 | ❌ EventCollector 只是**转发者**，调用 `ds.Release()` |
+| memory control 直接执行释放 | ❌ memory control 只**发送 feedback**，不直接操作队列 |
+| DynamicStream 是被动的 | ❌ DynamicStream 是**执行者**，`eventQueue.releasePath()` 真正清空队列 |
+
+**path 选择算法总结：**
+```
+选择优先级 = lastHandleEventTs 降序（越久没处理越优先）
+筛选条件   = blocking=true && pendingSize >= 256
+释放目标   = totalPendingSize * 40%
+```
+
 术语说明：可丢弃事件（[Droppable](#c-terminology)）
 - 含义：EventType.Droppable=true 的事件可被内存控制丢弃。
 - 代码引用：见下方代码片段（EventType.Droppable 定义 + OnDrop 分支）。
