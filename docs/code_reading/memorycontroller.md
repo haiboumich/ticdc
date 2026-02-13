@@ -44,7 +44,7 @@
 │        │ ① gRPC Stream（LogPuller 主动订阅 Pull 模式）                                      │ │
 │        ▼                                                                                 │ │
 │   ┌─────────────────────────────────────────────────────────────────────────────────────┐  │ │
-│   │                              TiCDC 进程（单例）                                       │  │ │
+│   │                         TiCDC 进程（进程内单例）                                      │  │ │
 │   │                                                                                     │  │ │
 │   │  ┌───────────────────────────────────────────────────────────────────────────────┐  │  │ │
 │   │  │                        上游链路（数据入口）                                       │  │  │ │
@@ -108,7 +108,7 @@
 |---------|------|------|
 | ① TiKV → LogPuller | **Pull（拉取）** | LogPuller 通过 gRPC 主动订阅 TiKV 变更 |
 | ② EventService → EventCollector | **Push（推送）** | EventService 通过 Messaging 主动推送事件 |
-| ③ Dispatcher → MySQL | **Push（推送）** | Dispatcher 主动写入下游数据库 |
+| ③ Dispatcher → Sink | **Push（推送）** | Dispatcher 主动写入下游（MySQL/Kafka/…） |
 
 ### 组件关系说明
 
@@ -116,7 +116,7 @@
 |------|------|------|
 | **LogPuller** | 从 TiKV 拉取变更数据 | 通过 gRPC Stream 订阅 TiKV |
 | **EventStore** | 持久化存储变更数据 | 使用 PebbleDB 存储，被 EventService 持有 |
-| **EventService** | 事件分发服务（单例） | 持有 EventStore，扫描并推送事件给 EventCollector |
+| **EventService** | 事件分发服务（进程内单例） | 持有 EventStore，扫描并推送事件给 EventCollector |
 | **EventCollector** | 接收并路由事件 | 接收 EventService 推送，路由给 Dispatcher |
 | **Dispatcher** | 处理事件并写入下游 | 通过 Sink 写入 MySQL/Kafka |
 
@@ -151,10 +151,12 @@
 ### 关键点
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│  1. LogPuller 靠近数据源：如果暂停 → TiKV 会缓存数据，不会丢失                                │
-│  2. EventCollector 靠近数据目的地：如果丢弃 → 可从 EventStore 重新拉取                        │
+│  1. LogPuller 靠近数据源：如果暂停 → TiKV 会在 GC safepoint 时间窗口内缓存数据                 │
+│     （需配合 tikv_gc_life_time 配置，默认 10m；超时可能丢失）                                   │
+│  2. EventCollector 靠近数据目的地：如果丢弃 → 可从 EventStore 重新拉取                         │
+│     （前提：EventStore 数据未被 GC，且上游 TiKV 数据仍在 safepoint 内）                         │
 │  3. 两者都在同一进程，但在数据流中位置不同，面对的约束不同，所以用不同策略                        │
-│  4. EventService 是单例，EventStore 也是单例，统一管理事件分发                                 │
+│  4. EventService 和 EventStore 均为进程内单例，统一管理该进程的事件分发                         │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 
 ---
@@ -270,16 +272,20 @@ case feedback := <-s.ds.Feedback():
 #### 2.4 Puller 算法阈值
 ```golang
 // utils/dynstream/memory_control_algorithm.go:43-76
-// PullerMemoryControl 的阈值
+// PullerMemoryControl 的阈值定义
 
-// Path 级别
+// Path 级别（定义于 ShouldPausePath，但运行时未调用）
 if memoryUsageRatio < 0.1 { ... }   // resume 阈值：10%
 if memoryUsageRatio >= 0.2 { ... }  // pause 阈值：20%
 
-// Area 级别
+// Area 级别（实际运行时使用的阈值）
+// 参见 utils/dynstream/memory_control.go:226 - updateAreaPauseState 只调用 ShouldPauseArea
 if memoryUsageRatio < 0.5 { ... }   // resume 阈值：50%
 if memoryUsageRatio >= 0.8 { ... }  // pause 阈值：80%
 ```
+
+> ⚠️ **注意**：`ShouldPausePath` 方法定义在算法接口中，但当前运行时逻辑（`memory_control.go:226`）只调用 `ShouldPauseArea`。
+> Path 级别阈值存在于算法定义中，但**实际 pause/resume 决策仅基于 Area 级别**。
 
 ---
 
@@ -737,14 +743,16 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 | **代码引用** | `logservice/logpuller/subscription_client.go:364` | `downstreamadapter/eventcollector/event_collector.go:270` |
 | **核心机制** | Pause/Resume (阻塞/恢复) | ReleasePath (丢弃/清空) |
 | **内存配额** | 1GB（硬编码） | changefeed 配置（默认 1GB） |
-| **Path pause 阈值** | pause: 20%, resume: 10% | 动态计算 |
-| **Area pause 阈值** | pause: 80%, resume: 50% | **不触发** |
+| **Path pause 阈值** | pause: 20%, resume: 10% ⚠️ | 动态计算 |
+| **Area pause 阈值** | pause: 80%, resume: 50% ✅ | **不触发** |
 | **Deadlock 检测** | 无 | 5s 内有入队 && 无出队 |
 | **Deadlock 高水位** | 无 | 60% |
 | **强制释放** | 无 | 150% |
 | **释放比例** | N/A | 40% |
-| **数据完整性** | **保证** | **不保证** |
-| **OOM 风险** | 较高 | 较低 |
+| **数据完整性** | **保证**（GC safepoint 内） | **不保证**（可从上游恢复） |
+| **OOM 风险** | 中等（依赖消费者正常工作） | 较低（可快速释放） |
+
+> ⚠️ **Path pause 阈值说明**：Puller 算法的 Path 级别阈值（20%/10%）定义于 `ShouldPausePath` 接口，但**运行时实际只调用 `ShouldPauseArea`**（参见 `memory_control.go:226`）。EventCollector 算法的 Path 阈值是动态计算的。
 
 ---
 
@@ -753,7 +761,9 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 
 #### Q1: Puller 算法会不会永远 hang 住？
 
-**问题**：假设 path 超过 20% 一直不下来，或者 area 超过 80% 一直不下来，LogPuller 是不是就一直 hang 住了？
+**问题**：假设 area 超过 80% 一直不下来，LogPuller 是不是就一直 hang 住了？
+
+> ⚠️ **注意**：当前运行时逻辑只评估 Area 级别的 pause/resume（参见 `memory_control.go:226`），Path 级别阈值（20%/10%）定义于算法接口但未被调用。
 
 **解答**：
 
@@ -796,12 +806,13 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 │   └─────────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                             │
 │   ┌─────────────────────────────────────────────────────────────────────────────────────┐   │
-│   │  3. TiKV 侧的缓冲能力                                                                 │   │
+│   │  3. TiKV 侧的缓冲能力（有条件）                                                        │   │
 │   │                                                                                     │   │
 │   │     即使 LogPuller hang 住：                                                         │   │
-│   │     - TiKV 会缓存未消费的数据（通过 resolvedTs 机制）                                   │   │
-│   │     - 不会丢失数据                                                                   │   │
-│   │     - 恢复后可以继续拉取                                                              │   │
+│   │     - TiKV 会在 GC safepoint 时间窗口内缓存未消费数据                                   │   │
+│   │     - 前提：暂停时间 < tikv_gc_life_time（默认 10m）                                   │   │
+│   │     - 超时风险：超过 GC safepoint 后数据会被清理                                        │   │
+│   │     - 恢复后：在 safepoint 内可继续拉取                                                │   │
 │   │                                                                                     │   │
 │   └─────────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                             │
@@ -836,17 +847,35 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 │   └─────────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                             │
 │   ┌─────────────────────────────────────────────────────────────────────────────────────┐   │
-│   │                          关键机制 2：checkpointTs + heartbeat                        │   │
+│   │                    关键机制 2：checkpointTs + heartbeat + DropEvent reset            │   │
 │   │                                                                                     │   │
-│   │   • Dispatcher 维护 checkpointTs（已成功写入下游的时间戳）                              │   │
-│   │   • 只有事件成功写入下游后，checkpointTs 才会更新                                       │   │
-│   │   • Dispatcher 每 200ms 通过 heartbeat 上报 checkpointTs 给 EventService              │   │
+│   │   • Dispatcher 维护 checkpointTs（已处理事件的时间戳进度）                              │   │
+│   │   • checkpointTs 语义：通常是已写入下游的时间戳，但也有例外                              │   │
+│   │     - 正常：已 flush 事件的 commitTs - 1                                             │   │
+│   │     - 空队列时：max(checkpointTs, resolvedTs) 作为 fallback                           │   │
+│   │     - 特殊场景：PassBlockEventToSink 直接 pass-through                                │   │
+│   │   • Heartbeat 机制（见下方详细说明）                                                  │   │
 │   │   • EventService 根据 checkpointTs 从 EventStore 扫描数据发送                          │   │
 │   │                                                                                     │   │
 │   │   代码：                                                                             │   │
-│   │   • downstreamadapter/dispatcher/table_progress.go:166-174 (GetCheckpointTs)        │   │
-│   │   • downstreamadapter/dispatchermanager/task.go:58 (heartbeat)                       │   │
-│   │   • pkg/eventservice/dispatcher_stat.go:85-87 (checkpointTs 说明)                    │   │
+│   │   • downstreamadapter/dispatcher/table_progress.go:174-185 (GetCheckpointTs)        │   │
+│   │   • downstreamadapter/dispatcher/basic_dispatcher.go:485-494 (checkpointTs 逻辑)    │   │
+│   │   • downstreamadapter/dispatchermanager/task.go:49-60 (heartbeat task)              │   │
+│   │                                                                                     │   │
+│   └─────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                    关键机制 3：DropEvent 触发 Dispatcher reset                        │   │
+│   │                                                                                     │   │
+│   │   ReleasePath 丢弃事件时：                                                           │   │
+│   │   1. OnDrop 创建 DropEvent (helper.go:169-174)                                      │   │
+│   │   2. handleDropEvent 接收并调用 reset() (dispatcher_stat.go:604-610)                │   │
+│   │   3. reset() 触发与 EventService 重新握手                                            │   │
+│   │   4. EventService 从 checkpointTs 重新发送数据                                        │   │
+│   │                                                                                     │   │
+│   │   代码：                                                                             │   │
+│   │   • downstreamadapter/eventcollector/helper.go:169-174 (OnDrop)                     │   │
+│   │   • downstreamadapter/eventcollector/dispatcher_stat.go:604-610 (handleDropEvent)   │   │
 │   │                                                                                     │   │
 │   └─────────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                             │
@@ -864,28 +893,43 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 │   │                                                                                     │   │
 │   └─────────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                             │
-│   ReleasePath 后恢复：                                                                       │
+│   ReleasePath 后恢复（实际流程）：                                                          │
 │   ┌─────────────────────────────────────────────────────────────────────────────────────┐   │
 │   │                                                                                     │   │
 │   │   1. ReleasePath 触发，队列中 Ts=100~200 的事件被丢弃                                 │   │
 │   │                                                                                     │   │
-│   │   2. Dispatcher 的 checkpointTs 仍然是 99（因为 100~200 没写入成功）                  │   │
+│   │   2. OnDrop 创建 DropEvent，handleDropEvent 调用 reset()                             │   │
 │   │      ┌────────────────────────────────────────────────────────────┐                 │   │
-│   │      │ 关键点：只有写入成功才更新 checkpointTs                       │                 │   │
-│   │      │ 丢弃的事件不会影响 checkpointTs                              │                 │   │
+│   │      │ 关键：DropEvent 触发 dispatcher reset，而非仅依赖 heartbeat   │                 │   │
 │   │      └────────────────────────────────────────────────────────────┘                 │   │
 │   │                                                                                     │   │
-│   │   3. 下次 heartbeat 上报 checkpointTs=99                                            │   │
+│   │   3. reset() 触发与 EventService 重新握手                                            │   │
 │   │                                                                                     │   │
-│   │   4. EventService 从 EventStore 重新扫描 Ts > 99 的事件                              │   │
-│   │      ┌────────────────────────────────────────────────────────────┐                 │   │
-│   │      │ EventStore 有所有数据的持久化副本                            │                 │   │
-│   │      │ 扫描 Ts > 99 会重新获取 100~200 的事件                       │                 │   │
-│   │      └────────────────────────────────────────────────────────────┘                 │   │
+│   │   4. EventService 从 checkpointTs（仍为 99）重新扫描 EventStore                       │   │
+│   │      前提：EventStore 数据未被 GC，且 TiKV 数据在 GC safepoint 内                     │   │
 │   │                                                                                     │   │
-│   │   5. EventService 重新推送 Ts=100~200 的事件                                         │   │
+│   │   5. EventService 重新推送 Ts > 99 的事件                                             │   │
 │   │                                                                                     │   │
 │   │   6. 数据恢复，继续正常处理                                                          │   │
+│   │                                                                                     │   │
+│   └─────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                             │
+│   Heartbeat 机制详解：                                                                       │
+│   ┌─────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                                     │   │
+│   │   HeartBeatTask.Execute() (task.go:49-60):                                          │   │
+│   │   • executeInterval = 200ms（task 执行间隔）                                         │   │
+│   │   • completeStatusInterval = 50（即 10s / 200ms）                                    │   │
+│   │   • needCompleteStatus = (statusTick % 50 == 0)                                      │   │
+│   │                                                                                     │   │
+│   │   实际行为：                                                                         │   │
+│   │   • 每 200ms 执行一次 task loop                                                      │   │
+│   │   • 完整状态上报（含所有 dispatcher checkpointTs）：约每 10s 一次                       │   │
+│   │   • 简化上报（不含完整状态）：每 200ms                                                 │   │
+│   │                                                                                     │   │
+│   │   恢复触发方式：                                                                     │   │
+│   │   • DropEvent -> reset() 是主动触发（即时）                                           │   │
+│   │   • Heartbeat 是周期性同步（非即时）                                                  │   │
 │   │                                                                                     │   │
 │   └─────────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                             │
@@ -897,16 +941,16 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 | 机制 | 作用 | 代码位置 |
 |------|------|---------|
 | **EventStore 持久化** | 数据副本，支持重新扫描 | `logservice/eventstore/event_store.go` |
-| **checkpointTs** | 只有写入成功才更新 | `downstreamadapter/dispatcher/table_progress.go:166-174` |
-| **heartbeat** | 每 200ms 上报 checkpointTs | `downstreamadapter/dispatchermanager/task.go:58` |
-| **扫描逻辑** | 根据 checkpointTs 从 EventStore 扫描 | `pkg/eventservice/dispatcher_stat.go:85-87` |
+| **checkpointTs** | 追踪已处理事件进度（有 fallback 机制） | `downstreamadapter/dispatcher/table_progress.go:174-185` |
+| **DropEvent + reset** | 丢弃事件后主动触发重新握手 | `downstreamadapter/eventcollector/dispatcher_stat.go:604-610` |
+| **heartbeat** | 周期性同步状态（完整状态约 10s/次） | `downstreamadapter/dispatchermanager/task.go:49-60` |
 
 | 场景 | 结果 |
 |------|------|
-| 事件被丢弃 | 数据在 EventStore 中仍存在 |
-| Dispatcher 的 checkpointTs | 不会更新，保持旧值 |
-| 恢复机制 | 下次 heartbeat 后，EventService 根据 checkpointTs 重新扫描 |
-| 数据丢失？ | **不会永久丢失** |
+| 事件被丢弃 | OnDrop 创建 DropEvent -> reset() 重新握手 |
+| Dispatcher 的 checkpointTs | 保持旧值，作为重新扫描起点 |
+| 恢复机制 | DropEvent 触发 reset -> EventService 从 checkpointTs 重新推送 |
+| 数据丢失？ | **不会永久丢失**（前提：EventStore/TiKV 数据未超 GC） |
 | 代价 | 重新拉取增加网络/CPU 开销，延迟增加 |
 
 ---
