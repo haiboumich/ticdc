@@ -117,8 +117,62 @@
 | **LogPuller** | 从 TiKV 拉取变更数据 | 通过 gRPC Stream 订阅 TiKV |
 | **EventStore** | 持久化存储变更数据 | 使用 PebbleDB 存储，被 EventService 持有 |
 | **EventService** | 事件分发服务（进程内单例） | 持有 EventStore，扫描并推送事件给 EventCollector |
-| **EventCollector** | 接收并路由事件 | 接收 EventService 推送，路由给 Dispatcher |
-| **Dispatcher** | 处理事件并写入下游 | 通过 Sink 写入 MySQL/Kafka |
+| **EventCollector** | 接收并路由事件 | 接收 EventService 推送，路由给 Dispatcher（每个 changefeed 一个实例） |
+| **Dispatcher** | 处理事件并写入下游 | 通过 Sink 写入 MySQL/Kafka，**每个表对应一个 Dispatcher** |
+
+### 组件映射关系（关键概念）
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              TiCDC 组件映射关系与作用域                                      │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   组件                    │       作用域               │       对应关系                      │
+│   ────────────────────────────────────────────────────────────────────────────────────────  │
+│   LogPuller              │   订阅级别 (subscriptionID)   │   一个订阅 → 多个 region        │
+│   EventStore             │   进程内单例                 │   全局唯一的持久化存储           │
+│   EventService           │   进程内单例                 │   全局唯一的分发服务            │
+│   EventCollector         │   changefeed 级别            │   一个 changefeed → 一个实例     │
+│   DynamicStream(下游)    │   changefeed 级别 (Area)     │   一个 changefeed → 一个 Area    │
+│   Dispatcher            │   table 级别 (Path)         │   每个表 → 一个 Dispatcher       │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**层级关系示意图：**
+
+```
+TiCDC 进程
+│
+├── [单例] EventStore          ← 存储所有 changefeed 的数据
+│                              │
+├── [单例] EventService        ← 统一分发事件给所有 changefeed
+│                              │
+└── 多个 Changefeed 实例
+    │
+    ├── Changefeed A (包含多个表)
+    │   │                        → EventCollector A → Area A (memory control)
+    │   ├── Dispatcher A1 (表1) → Path A1
+    │   ├── Dispatcher A2 (表2) → Path A2
+    │   └── Dispatcher A3 (表3) → Path A3
+    │
+    ├── Changefeed B (包含多个表)
+    │   │                        → EventCollector B → Area B (memory control)
+    │   ├── Dispatcher B1 (表4) → Path B1
+    │   └── Dispatcher B2 (表5) → Path B2
+    │
+    └── Changefeed C (包含多个表)
+        │                        → EventCollector C → Area C (memory control)
+        ├── Dispatcher C1 (表6) → Path C1
+        └── Dispatcher C2 (表7) → Path C2
+```
+
+**关键要点：**
+1. **EventStore、EventService 是进程内单例**：服务于所有 changefeed
+2. **LogPuller 按订阅组织**：一个订阅可能包含多个 region，但不直接对应 changefeed
+3. **EventCollector 按 changefeed 划分**：每个 changefeed 有独立的 EventCollector 实例
+4. **Dispatcher 是表级别的**：一个 changefeed 包含多个表，每个表对应一个 Dispatcher
+5. **下游 memory control 的 Area/Path 映射**：Area → Changefeed，Path → Dispatcher (每个表一个 Path)
 
 ### 关键设计决策
 
@@ -1070,6 +1124,51 @@ func NewCDCBaseKey(clusterID string) string {
     - 内存配额：1GB（硬编码）
     - 参考：`logservice/logpuller/subscription_client.go`。
 
+- **Subscription（订阅）**：LogPuller 中的订阅管理单位，对应一个表的完整数据订阅。
+    - **关键特点**：一个订阅管理一个表的完整 span 范围内的所有 region
+    - **订阅结构**：
+      ```
+      subscriptionClient
+      └── totalSpans.spanMap map[SubscriptionID]*subscribedSpan
+          ├── SubscriptionID=1 → Table A 的完整 span (StartKey-A, EndKey-A)
+          │                       └── 管理该范围内的 ALL regions (Region 1, 2, 3, ...)
+          ├── SubscriptionID=2 → Table B 的完整 span
+          └── SubscriptionID=3 → Table C 的完整 span
+      ```
+    - **与 Region 的关系**：
+      - 一个订阅包含该表 span 范围内的所有 region
+      - Region split 后，新 region 仍由原订阅管理
+      - 订阅之间是独立的，不是"多个订阅合起来组成一个完整订阅"
+    - **创建时机**：EventStore 为每个 dispatcher 创建一个订阅（`event_store.go:642`）
+    - **映射关系**：SubscriptionID → Dispatcher → Table
+    - 参考：`logservice/logpuller/subscription_client.go:109-129`、`logservice/logpuller/subscription_client.go:202-205`。
+
+- **SubscribedSpan**：订阅的具体实现，存储订阅的 span 范围和状态。
+    - 包含：subID（订阅ID）、span（表的 key 范围）、startTs（开始时间戳）、resolvedTs 等
+    - 参考：`logservice/logpuller/subscription_client.go:109-129`。
+
+- **订阅与 Dispatcher 的关系**：通常是一一对应关系（都是表级别），但存在特殊情况。
+    - **通常情况（一一对应）**：
+      ```
+      Table A → Dispatcher A1 → SubscriptionID=1 (Table A 的完整 span)
+      Table B → Dispatcher B1 → SubscriptionID=2 (Table B 的完整 span)
+      ```
+    - **特殊情况（一对多）**：当 Dispatcher 的 span 切换时，可能同时关联两个订阅：
+      ```
+      Table C → Dispatcher C1 → SubscriptionID=3 (原 span, subStat)
+                                 → SubscriptionID=4 (新 span, pendingSubStat)
+      ```
+      注：参考 `event_store.go:118-125` 关于 subStat/pendingSubStat 的说明
+    - **连接方式**：订阅和 Dispatcher 通过 EventStore 连接，不是直接关联
+      ```
+      EventStore.tableStats[TableID][SubscriptionID] = subscriptionStat
+      ```
+    - **相同点**：两者都是表级别的组织单位
+    - **不同点**：
+      - 订阅：LogPuller 层面，管理从 TiKV 拉取的数据
+      - Dispatcher：EventCollector 层面，管理发送到下游的数据
+    - 参考：`logservice/eventstore/event_store.go:589`。
+
 - **EventCollector**：下游组件，作为 EventService 与 Dispatcher 之间的中继。
     - **注意：名字有误导性**，实际职责是"路由/分发"
     - 使用 EventCollector 算法 + ReleasePath 机制
@@ -1081,7 +1180,7 @@ func NewCDCBaseKey(clusterID string) string {
     - 参考：`utils/dynstream/interfaces.go:26`。
 
 - **Path**：DynamicStream 中的目的端标识，对应一个事件队列。
-    - EventCollector 中映射为 DispatcherID
+    - EventCollector 中映射为 DispatcherID（**每个表一个 Dispatcher**）
     - 参考：`utils/dynstream/interfaces.go:23`。
 
 - **MemoryQuota**：changefeed 内存配额（字节），默认 1GB。
