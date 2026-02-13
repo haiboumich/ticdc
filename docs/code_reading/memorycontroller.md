@@ -1173,6 +1173,7 @@ func NewCDCBaseKey(clusterID string) string {
     - 参考：`utils/dynstream/memory_control_algorithm.go:159-163`。
 
 - **LogPuller**：上游组件，从 TiKV 拉取变更数据。
+    - **拉取内容**：TiKV 的原始 KV 变更数据（Raw KV Changes）
     - 使用 Puller 算法 + Pause/Resume 机制
     - 内存配额：1GB（硬编码）
     - 参考：`logservice/logpuller/subscription_client.go`。
@@ -1223,6 +1224,7 @@ func NewCDCBaseKey(clusterID string) string {
     - 参考：`logservice/eventstore/event_store.go:589`。
 
 - **EventCollector**：下游组件，作为 EventService 与 Dispatcher 之间的中继。
+    - **写入下游**：Dispatcher → Sink 写入 MySQL/Kafka/其他存储
     - **注意：名字有误导性**，实际职责是"路由/分发"
     - 使用 EventCollector 算法 + ReleasePath 机制
     - 内存配额：changefeed 配置
