@@ -797,8 +797,8 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 | **代码引用** | `logservice/logpuller/subscription_client.go:364` | `downstreamadapter/eventcollector/event_collector.go:270` |
 | **核心机制** | Pause/Resume (阻塞/恢复) | ReleasePath (丢弃/清空) |
 | **内存配额** | 1GB（硬编码） | changefeed 配置（默认 1GB） |
-| **Path pause 阈值** | pause: 20%, resume: 10% ⚠️ | 动态计算 |
-| **Area pause 阈值** | pause: 80%, resume: 50% ✅ | **不触发** |
+| **Path pause 阈值** | 20%/10%（定义存在，**未生效** ⚠️） | 动态计算（定义存在，**未生效** ⚠️） |
+| **Area pause 阈值** | pause: 80%, resume: 50% ✅ | **不触发**（始终返回 false） |
 | **Deadlock 检测** | 无 | 5s 内有入队 && 无出队 |
 | **Deadlock 高水位** | 无 | 60% |
 | **强制释放** | 无 | 150% |
@@ -806,7 +806,9 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 | **数据完整性** | **保证**（GC safepoint 内） | **不保证**（可从上游恢复） |
 | **OOM 风险** | 中等（依赖消费者正常工作） | 较低（可快速释放） |
 
-> ⚠️ **Path pause 阈值说明**：Puller 算法的 Path 级别阈值（20%/10%）定义于 `ShouldPausePath` 接口，但**运行时实际只调用 `ShouldPauseArea`**（参见 `memory_control.go:226`）。EventCollector 算法的 Path 阈值是动态计算的。
+> ⚠️ **Path pause 阈值说明**：Puller 算法和 EventCollector 算法的 Path 级别阈值都定义于 `ShouldPausePath` 接口，但**运行时实际只调用 `ShouldPauseArea`**（参见 `memory_control.go:226`）。因此 Path 级别的暂停/恢复机制**当前未生效**。
+>
+> 💡 **运行时实际情况**：当前只有 Puller 算法的 Area pause 阈值（80%/50%）在实际生效。EventCollector 的 `ShouldPauseArea` 始终返回 false，不触发暂停。因此**当前没有实现 Path 级别的渐进式控制**（即先暂停部分 path，再暂停整个 area）。
 
 ---
 
@@ -1064,6 +1066,54 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 
 ---
 
+#### Q4: 两种算法的实际运行机制有什么区别？
+
+**问题**：上游用 Puller 算法，下游用 EventCollector 算法，它们的实际运行机制有什么本质区别？
+
+**解答**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              两种算法的实际运行机制对比                                  │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   上游 LogPuller + Puller 算法                                                          │
+│   ────────────────────────────────────                                                     │
+│   运行时：只调用 ShouldPauseArea                                                          │
+│   • Area pause 阈值：80% 暂停，50% 恢复 ✅ 实际生效                                  │
+│   • Path pause 阈值：20%/10% ❌ 未生效（定义了但未调用）                              │
+│   • 机制：Pause/Resume（阻塞/恢复）                                                   │
+│   • 渐进式控制：❌ 无（只有 Area 全或无）                                             │
+│                                                                                             │
+│   ────────────────────────────────────────────────────────────────────────────────────────   │
+│                                                                                             │
+│   下游 EventCollector + EventCollector 算法                                              │
+│   ──────────────────────────────────────────────                                             │
+│   运行时：不关心 Path/Area 的 pause/resume                                               │
+│   • ShouldPauseArea：始终返回 false ❌ 不触发                                          │
+│   • ShouldPausePath：定义了但未调用 ❌ 未生效                                         │
+│   • 机制：ReleasePath（直接清空队列） ✅ 实际生效                                      │
+│   • 控制粒度：Path 级别（逐个释放队列）                                              │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**关键区别总结：**
+
+| 维度 | 上游 | 下游 EventCollector |
+|------|---------------------|-------------------|
+| **是否使用 pause/resume** | ✅ 是 | ❌ 否 |
+| **控制级别** | Area（整个订阅） | Path（单个表） |
+| **渐进式控制** | ❌ 无（只有全或无） | ✅ 有（逐个释放） |
+| **核心机制** | Pause/Resume | ReleasePath |
+
+**核心要点：**
+1. **上游"没有渐进式"**：只有 Area 级别的 50/80 阈值，Path 级别的 20/10 虽然定义了但未生效
+2. **下游"不用关心 path 和 area 的 pause"**：EventCollector 算法的 ShouldPauseArea 始终返回 false，核心就是**直接 release path**
+3. **下游的"渐进式"体现在 ReleasePath**：不是逐个暂停，而是**逐个释放队列**，达到类似渐进式的效果
+
+---
+
 <a id="sec-c5-new-arch"></a>
 ### 5 新架构其他变化
 
@@ -1108,13 +1158,16 @@ func NewCDCBaseKey(clusterID string) string {
     - 参考：`utils/dynstream/memory_control.go:293`、`utils/dynstream/memory_control.go:43`。
 
 - **Puller 算法**：`MemoryControlForPuller=0`，为数据源头设计的算法。
-    - 机制：Pause/Resume（阻塞/恢复）
+    - 机制：Pause/Resume（阻塞/恢复）⚠️ **运行时只有 Area 级别生效**
+    - Area pause 阈值：80% 暂停，50% 恢复 ✅ 实际生效
+    - Path pause 阈值：20%/10% ❌ 定义但未调用（运行时未生效）
     - 特点：数据完整性保证，适合上游有缓冲能力的场景
     - 使用者：LogPuller
     - 参考：`utils/dynstream/memory_control_algorithm.go:43-76`。
 
 - **EventCollector 算法**：`MemoryControlForEventCollector=1`，为中间处理层设计的算法。
-    - 机制：ReleasePath（丢弃/清空）
+    - 机制：ReleasePath（丢弃/清空）✅ **不使用 Pause/Resume**
+    - ShouldPauseArea：始终返回 false ❌ 不触发暂停
     - 特点：快速释放内存，适合可从上游重新获取数据的场景
     - 使用者：EventCollector
     - 参考：`utils/dynstream/memory_control_algorithm.go:159-163`。
