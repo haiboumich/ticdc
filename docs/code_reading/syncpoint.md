@@ -1,5 +1,20 @@
 # SyncPoint 代码分析
 
+**TL;DR**：
+- **Too Long; Didn't Read**：本文档详细说明 SyncPoint 的运行机制、配置项、与下游组件的交互
+- **核心内容**：
+  - SyncPoint 作为阻塞事件（NonBatchable）影响可用内存
+  - MySQL Sink 写入路径使用 syncpoint_v1 + ddl_ts_v1
+  - 与 Memory Controller 的交互见 `docs/code_reading/syncpoint_redo_memorycontroller.md`
+- **关键结论**：
+  - SyncPoint Event 会阻塞调度，降低并发吞吐
+  - redo path 有独立的 DynamicStream 和内存控制
+  - SyncPoint 的生成频率影响阻塞密度
+- **适用场景**：理解 SyncPoint 如何影响主链路性能
+- **阅读建议**：按目录阅读，重点关注配置项和 Sink 写入路径
+
+---
+
 说明：以下按“配置入口 -> 生成 -> 分发 -> 下游写入”的链路组织；每条记录包含 `文件:行号`、代码片段、说明。
 
 目录：
