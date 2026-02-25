@@ -34,7 +34,6 @@
   - [2 架构图与时序图](#sec-c2-diagrams)
   - [3 阈值与行为对比](#sec-c3-thresholds)
   - [4 Area/Path 内存配额详解](#sec-c4-memory-quota)
-  - [5 新架构其他变化](#sec-c4-new-arch)
 - [D. 常见问题解答](#d-faq)
   - [Q1: Puller 算法会不会永远 hang 住？](#q1-puller-hang)
   - [Q2: EventCollector 直接 release 了，数据不会丢失吗？](#q2-eventcollector-release)
@@ -53,6 +52,7 @@
   - [5 设计问题二：EventStore 存储无限制增长风险](#sec-e5-problem2)
   - [6 场景分析：一个 path 影响全局的实际影响](#sec-e6-scenario)
 - [F. 术语汇总小节](#f-terminology)
+- [G. 新架构其他变化](#g-new-arch)
 
 ---
 
@@ -2042,37 +2042,6 @@ if !ok {
 
 ---
 
-<a id="sec-c4-new-arch"></a>
-### 5 新架构其他变化
-
-除了 memory controller，新架构还有以下关键变化：
-
-| 变化项 | 老架构 | 新架构 |
-|--------|--------|--------|
-| **启动方式** | 默认启动 | 需要 `--newarch` 或 `TICDC_NEWARCH=true` |
-| **TiKV 版本要求** | 无特殊要求 | 最低 7.5.0 |
-| **etcd key 前缀** | `/tidb/cdc/` | `/tidb/cdc_new/` |
-| **表数量支持** | ~10万级别 | **100万+** |
-| **架构设计** | 单体式 | 云原生、模块化 |
-
-```golang
-// 新架构开关
-// cmd/cdc/server/server.go:67
-cmd.Flags().BoolVarP(&o.serverConfig.Newarch, "newarch", "x", ...)
-
-// TiKV 最低版本要求
-// pkg/version/check.go:48-49
-MinTiKVVersion = semver.New("7.5.0-alpha")
-
-// etcd key 前缀变化
-// pkg/etcd/etcdkey.go:117-118
-func NewCDCBaseKey(clusterID string) string {
-    return fmt.Sprintf("/tidb/cdc_new/%s", clusterID)
-}
-```
-
----
-
 <a id="q9-blocking-meaning"></a>
 #### Q9: `blocking = true` 是什么意思？为什么消费慢的 path 反而被优先丢弃？
 
@@ -2997,3 +2966,34 @@ case feedback := <-s.ds.Feedback():
     - PauseArea：暂停该 area 的所有事件入队
     - ResumeArea：恢复该 area 的事件入队
     - 参考：`utils/dynstream/interfaces.go`。
+
+---
+
+<a id="g-new-arch"></a>
+## G. 新架构其他变化
+
+除了 memory controller，新架构还有以下关键变化：
+
+| 变化项 | 老架构 | 新架构 |
+|--------|--------|--------|
+| **启动方式** | 默认启动 | 需要 `--newarch` 或 `TICDC_NEWARCH=true` |
+| **TiKV 版本要求** | 无特殊要求 | 最低 7.5.0 |
+| **etcd key 前缀** | `/tidb/cdc/` | `/tidb/cdc_new/` |
+| **表数量支持** | ~10万级别 | **100万+** |
+| **架构设计** | 单体式 | 云原生、模块化 |
+
+```golang
+// 新架构开关
+// cmd/cdc/server/server.go:67
+cmd.Flags().BoolVarP(&o.serverConfig.Newarch, "newarch", "x", ...)
+
+// TiKV 最低版本要求
+// pkg/version/check.go:48-49
+MinTiKVVersion = semver.New("7.5.0-alpha")
+
+// etcd key 前缀变化
+// pkg/etcd/etcdkey.go:117-118
+func NewCDCBaseKey(clusterID string) string {
+    return fmt.Sprintf("/tidb/cdc_new/%s", clusterID)
+}
+```
