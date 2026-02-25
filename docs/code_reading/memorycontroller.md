@@ -43,6 +43,7 @@
   - [Q5: 增量扫期间如果触发 Memory Controller 暂停，会不会死锁？](#q5-deadlock)
   - [Q6: 如果一个 changefeed 的 area 超过 80%，所有表的 LogPuller 都会停下来吗？](#q6-global-pause)
   - [Q7: 两种算法的实际运行机制有什么区别？](#q7-runtime-diff)
+  - [Q8: 除了熔断式算法，有没有前置流控机制？](#q8-congestion-control)
 - [E. 设计问题分析：单 Area 导致全局阻塞](#e-single-area-blocking)
   - [1 问题描述](#sec-e1-problem)
   - [2 根因分析](#sec-e2-root-cause)
@@ -879,6 +880,102 @@ defaultReleaseMemoryRatio   = 0.4 // 释放比例默认 40%
 defaultDeadlockDuration    = 5 * time.Second // 死锁判定窗口为 5 秒
 // utils/dynstream/memory_control.go:38
 defaultReleaseMemoryThreshold = 256 // 只释放 pendingSize>=256 的阻塞 path
+```
+
+#### 5.1 正常消费时的内存释放（非异常情况）
+
+summary：说明事件被正常消费后，如何自动释放内存统计。要点如下：
+- **触发条件**：Sink 写成功后，事件从 pendingQueue 弹出
+- **释放机制**：popEvent → 减少 path.pendingSize → 减少 area.totalPendingSize
+- **与异常释放的区别**：正常释放是逐个事件释放，异常释放是批量清空队列
+
+**正常消费 vs 异常释放对比：**
+
+| 场景 | 触发条件 | 释放方式 | 数据影响 |
+|------|----------|----------|----------|
+| **正常消费** | Sink 写成功 | 逐个 popEvent 释放 | 数据完整写入下游 |
+| **死锁检测** | 5s 有入无出 + 内存>60% | 批量 ReleasePath | 丢弃数据，可重拉 |
+| **150% 强制释放** | 内存>=150% | 批量 ReleasePath | 丢弃数据，可重拉 |
+
+**正常消费的内存释放流程：**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  正常消费时的内存释放链路                                                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  handleLoop() 循环处理事件                                                            │
+│      │                                                                              │
+│      ▼                                                                              │
+│  popEvents(eventBuf) ────────────────────────────────────────────────────────────── │
+│      │                                                                              │
+│      ├── popEvent() 从 pendingQueue 弹出事件                                         │
+│      │       │                                                                      │
+│      │       ├── pendingQueue.PopFront()        // 1. 从队列移除事件                  │
+│      │       │                                                                      │
+│      │       ├── updatePendingSize(-size)       // 2. path.pendingSize 减少         │
+│      │       │                                                                      │
+│      │       └── areaMemStat.decPendingSize()   // 3. area.totalPendingSize 减少    │
+│      │               │                                                              │
+│      │               └── updateAreaPauseState() // 4. 可能触发 ResumeArea            │
+│      │                                                                              │
+│      ▼                                                                              │
+│  handler.Handle(events) ─────────────────────────────────────────────────────────── │
+│      │                                                                              │
+│      └── dispatcher.HandleEvents() → Sink 写入下游                                   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**代码证据：**
+
+```golang
+// utils/dynstream/stream.go:394-407 - popEvent() 每次消费一个事件
+func (pi *pathInfo[...]) popEvent() (eventWrap[...], bool) {
+    e, ok := pi.pendingQueue.PopFront()  // 从队列弹出
+    if !ok { return ..., false }
+
+    pi.updatePendingSize(int64(-e.eventSize))  // 减少 path 的 pendingSize
+    if pi.areaMemStat != nil {
+        pi.areaMemStat.decPendingSize(pi, int64(e.eventSize))  // 减少 area 的 totalPendingSize
+        pi.areaMemStat.lastSizeDecreaseTime.Store(time.Now())  // 更新最后释放时间
+    }
+    return e, true
+}
+
+// utils/dynstream/memory_control.go:283-291 - decPendingSize()
+func (as *areaMemStat[...]) decPendingSize(path *pathInfo[...], size int64) {
+    as.totalPendingSize.Add(int64(-size))  // 减少 area 总内存
+    as.updateAreaPauseState(path)          // 检查是否需要 Resume
+}
+```
+
+#### 5.2 LogPuller 与 EventCollector 的 Path 数据对比
+
+summary：说明两边 path 存储的数据内容不同，决定了内存控制策略的差异。
+
+| 组件 | Path 存储的数据 | 数据去向 | 释放时机 |
+|------|----------------|----------|----------|
+| **LogPuller** | TiKV 拉取的原始事件，**还没写入 EventStore** | 写入 EventStore | 写入成功后 popEvent |
+| **EventCollector** | EventStore→EventService 推送的事件，**还没写入下游 Sink** | 写入下游 (MySQL/Kafka等) | Sink 写成功后 popEvent |
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  LogPuller Path                         EventCollector Path                          │
+│  ══════════════                         ════════════════════                         │
+│                                                                                     │
+│  TiKV ──拉取──> pendingQueue ──写入──> EventStore ──推送──> pendingQueue ──写入──>  │
+│                   (path)                               (path)            Sink       │
+│                       │                                   │                          │
+│                  还没写入 EventStore               还没写入下游 Sink                  │
+│                                                                                     │
+│  【上游缓存】                              【下游缓存】                                │
+│                                                                                     │
+│  • 数据来源：TiKV Pull                    • 数据来源：EventStore Push               │
+│  • 控制策略：Pause/Resume（暂停拉取）      • 控制策略：ReleasePath（丢弃可重拉）      │
+│  • 设计理念：宁可慢，不能丢                • 设计理念：宁可丢，不能崩                │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1719,6 +1816,121 @@ for idx := range events {
 1. **上游"没有渐进式"**：只有 Area 级别的 50/80 阈值，Path 级别的 20/10 虽然定义了但未生效
 2. **下游"不用关心 path 和 area 的 pause"**：EventCollector 算法的 ShouldPauseArea 始终返回 false，核心就是**直接 release path**
 3. **下游的"渐进式"体现在 ReleasePath**：不是逐个暂停，而是**逐个释放队列**，达到类似渐进式的效果
+
+---
+
+<a id="q8-congestion-control"></a>
+#### Q8: 除了熔断式算法，有没有前置流控机制？
+
+**问题**：看起来 LogPuller 80% 就 pause，EventCollector 一达到指标就 releasePath，都是熔断式的。那在熔断之前有没有其他流控机制？还是说内存只要不超就"肆意妄为"地跑？
+
+**解答**：
+
+**确实存在前置流控机制**：`CongestionControl`。它是一种**背压（Backpressure）流控**，在熔断之前渐进式地控制流量。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         前置流控：CongestionControl 机制                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  EventCollector                              EventService (eventBroker)             │
+│       │                                          │                                  │
+│       │  每秒发送 CongestionControl 消息           │                                  │
+│       │  包含: availableMemory (可用内存)          │                                  │
+│       │ ─────────────────────────────────────────>│                                  │
+│       │                                          │                                  │
+│       │                              ┌───────────┴───────────┐                     │
+│       │                              │ 根据 availableMemory  │                     │
+│       │                              │ 动态调整 scan 速度    │                     │
+│       │                              └───────────┬───────────┘                     │
+│       │                                          │                                  │
+│       │      如果 available < scanLimit：        │                                  │
+│       │      • resetScanLimit() 降低扫描上限      │                                  │
+│       │      • allocQuota() 失败则跳过本次扫描    │                                  │
+│       │ <─────────────────────────────────────────│                                  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**代码证据：**
+
+```golang
+// downstreamadapter/eventcollector/event_collector.go:586-591
+// EventCollector 每秒发送 CongestionControl 消息
+case <-ticker.C:
+    messages := c.newCongestionControlMessages()
+    for serverID, m := range messages {
+        if len(m.GetAvailables()) != 0 {
+            // 发送可用内存信息给 EventService
+            msg := messaging.NewSingleTargetMessage(serverID, messaging.EventServiceTopic, m)
+            c.mc.SendCommand(msg)
+        }
+    }
+
+// pkg/eventservice/event_broker.go:605-617
+// EventService 根据可用内存调整扫描速度
+available := item.(*atomic.Uint64)
+if available.Load() < c.scanLimitInBytes {
+    task.resetScanLimit()  // 可用内存不足，降低扫描上限
+}
+
+sl := c.calculateScanLimit(task)
+ok = allocQuota(available, uint64(sl.maxDMLBytes))
+if !ok {
+    // 内存配额不够，跳过本次扫描
+    log.Debug("available memory quota is not enough, skip scan")
+    return
+}
+```
+
+**流控工作原理：**
+
+| 场景 | EventCollector 状态 | CongestionControl 反应 | 效果 |
+|------|---------------------|------------------------|------|
+| 下游消费正常 | availableMemory 充足 | EventService 正常扫描 | 流量正常 |
+| 下游消费变慢 | availableMemory 下降 | EventService 降低 scan 速度 | 减少推送到 path |
+| 下游消费很慢 | availableMemory 很低 | EventService 跳过扫描 | 停止推送 |
+
+**三层流控机制对比：**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              三层流控机制                                            │
+│                                                                                     │
+│   Layer 1: CongestionControl (前置流控) ← 本节重点                                   │
+│   ─────────────────────────────────────                                              │
+│   位置: EventService ↔ EventCollector                                               │
+│   触发: availableMemory 下降                                                         │
+│   效果: 降低 scan 速度或跳过扫描                                                      │
+│   性质: 渐进式、预防性                                                                │
+│   代码: event_broker.go:605-617                                                     │
+│                                                                                     │
+│                              ↓ 如果 Layer 1 没拦住                                   │
+│                                                                                     │
+│   Layer 2: PauseArea (上游熔断)                                                      │
+│   ────────────────────────────────                                                   │
+│   位置: LogPuller DynamicStream                                                     │
+│   触发: Area >= 80%                                                                 │
+│   效果: 暂停从 TiKV 拉取                                                              │
+│   性质: 断路式、保护性                                                                │
+│                                                                                     │
+│                              ↓ 如果 Layer 2 没拦住                                   │
+│                                                                                     │
+│   Layer 3: ReleasePath (下游熔断)                                                    │
+│   ──────────────────────────────────                                                 │
+│   位置: EventCollector DynamicStream                                                │
+│   触发: Area >= 150% 或死锁                                                          │
+│   效果: 丢弃队列数据                                                                  │
+│   性质: 断路式、兜底性                                                                │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**为什么本文档之前没提这个机制？**
+
+1. **模块归属不同**：CongestionControl 属于 EventService 模块，而本文档聚焦于 `dynstream/memory_control` 模块
+2. **机制性质不同**：Memory Controller 是**熔断式保护**（事后），CongestionControl 是**背压式流控**（事前）
+3. **配合关系**：两者是互补的，CongestionControl 是第一道防线，Memory Controller 是最后一道防线
 
 ---
 
