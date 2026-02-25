@@ -33,7 +33,8 @@
   - [1 设计理念与角色定位](#sec-c1-design)
   - [2 架构图与时序图](#sec-c2-diagrams)
   - [3 阈值与行为对比](#sec-c3-thresholds)
-  - [4 新架构其他变化](#sec-c4-new-arch)
+  - [4 Area/Path 内存配额详解](#sec-c4-memory-quota)
+  - [5 新架构其他变化](#sec-c4-new-arch)
 - [D. 常见问题解答](#d-faq)
   - [Q1: Puller 算法会不会永远 hang 住？](#q1-puller-hang)
   - [Q2: EventCollector 直接 release 了，数据不会丢失吗？](#q2-eventcollector-release)
@@ -1060,6 +1061,81 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 
 ---
 
+<a id="sec-c4-memory-quota"></a>
+### 4 Area/Path 内存配额详解
+
+**核心要点**：Area 和 Path 有独立的内存配额，**Path 配额不是 1GB**，而是 Area 的 10%（最少 1MB）。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│   EventCollector 内存配额分配示例 (假设 changefeed memory-quota = 1GB)        │
+│                                                                             │
+│   ┌───────────────────────────────────────────────────────────────────────┐ │
+│   │   Area = ChangefeedA                                                  │ │
+│   │   ├── maxPendingSize = 1GB          ← Area 配额 = changefeed 配额     │ │
+│   │   │                                                                   │ │
+│   │   ├── Path = Dispatcher1 (Table 1)                                    │ │
+│   │   │   └── pathMaxPendingSize = 100MB  ← Area 的 10% (最少 1MB)        │ │
+│   │   │                                                                   │ │
+│   │   ├── Path = Dispatcher2 (Table 2)                                    │ │
+│   │   │   └── pathMaxPendingSize = 100MB                                  │ │
+│   │   │                                                                   │ │
+│   │   └── Path = Dispatcher3 (Table 3)                                    │ │
+│   │       └── pathMaxPendingSize = 100MB                                  │ │
+│   │                                                                       │ │
+│   │   ⚠️ Area 总配额是 1GB，不是每个 Path 1GB                              │ │
+│   │   ⚠️ 所有 Path 的 pendingSize 之和受 Area 的 maxPendingSize 限制       │ │
+│   └───────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**配额计算规则：**
+
+| 层级 | 配额来源 | 默认值 | 计算方式 |
+|------|----------|--------|----------|
+| **Area** | changefeed 配置 `memory-quota` | **1GB** | `DefaultChangefeedMemoryQuota = 1024 * 1024 * 1024` |
+| **Path** | 自动计算 | **100MB** (当 Area=1GB) | `max(Area/10, 1MB)` |
+
+**代码证据：**
+
+```golang
+// pkg/config/server.go:44-45
+DefaultChangefeedMemoryQuota = 1024 * 1024 * 1024 // 1GB.
+
+// downstreamadapter/eventcollector/event_collector.go:270
+areaSetting := dynstream.NewAreaSettingsWithMaxPendingSize(
+    memoryQuota,                              // 来自 changefeed 配置
+    dynstream.MemoryControlForEventCollector,
+    "eventCollector")
+
+// utils/dynstream/interfaces.go:265-275
+func NewAreaSettingsWithMaxPendingSize(size uint64, ...) AreaSettings {
+    // The path max pending size is at least 1MB.
+    pathMaxPendingSize := max(size/10, 1*1024*1024)  // ← Area 的 10%，最少 1MB
+
+    return AreaSettings{
+        maxPendingSize:     size,             // ← Area 配额
+        pathMaxPendingSize: pathMaxPendingSize, // ← Path 配额
+        ...
+    }
+}
+```
+
+**LogPuller 与 EventCollector 的 Area/Path 配额对比：**
+
+| 维度 | LogPuller (上游) | EventCollector (下游) |
+|------|------------------|----------------------|
+| **Area 划分** | 单一 Area=0（硬编码） | 每个 changefeed 一个 Area |
+| **Area 配额来源** | 硬编码 1GB | changefeed 配置 `memory-quota` |
+| **Area 默认配额** | 1GB | 1GB |
+| **Path 配额** | Area 的 10%，最少 1MB | Area 的 10%，最少 1MB |
+| **Path 含义** | 每个订阅（表） | 每个 Dispatcher（表） |
+| **可配置性** | 不可配置 | 可通过 changefeed 配置调整 |
+
+> 💡 **实践建议**：如果某个 changefeed 订阅了大量表，可以适当增大 `memory-quota` 配置，避免单个 Path 达到配额限制影响整体性能。
+
+---
+
 <a id="d-faq"></a>
 ## D. 常见问题解答
 
@@ -1647,7 +1723,7 @@ for idx := range events {
 ---
 
 <a id="sec-c4-new-arch"></a>
-### 4 新架构其他变化
+### 5 新架构其他变化
 
 除了 memory controller，新架构还有以下关键变化：
 
