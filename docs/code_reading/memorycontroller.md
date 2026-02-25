@@ -1307,7 +1307,243 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 
 ---
 
-#### Q5: 如果一个 changefeed 的 area 超过 80%，所有表的 LogPuller 都会停下来吗？
+#### Q4: LogPuller 的增量扫和推流阶段对 Memory Controller 有影响吗？
+
+**问题**：LogPuller 有增量扫（Incremental Scan）和推流（Streaming）两个阶段，这两个阶段对 Memory Controller 的行为有区别吗？
+
+**解答**：
+
+**两个阶段确实存在**，但对 Memory Controller 来说是**透明的**，行为一致。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    增量扫 vs 推流：两个阶段的区别                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   区分标志：Initialized 状态                                                 │
+│   ─────────────────────────                                                 │
+│                                                                             │
+│   // regionlock/region_range_lock.go:66-72                                  │
+│   type LockedRangeState struct {                                            │
+│       ResolvedTs  atomic.Uint64                                             │
+│       Initialized atomic.Bool   // false = 增量扫, true = 推流             │
+│   }                                                                         │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  增量扫阶段（Initialized = false）                                   │   │
+│   │                                                                     │   │
+│   │  • TiKV 扫描 [startTs, 当前) 之间的历史数据                          │   │
+│   │  • 数据按 Key 排序，不是按 commitTs 时序排序                         │   │
+│   │  • ⚠️ resolvedTs 不推进（见下方代码）                                │   │
+│   │  • 下游不消费（因为没有 resolvedTs 更新）                             │   │
+│   │                                                                     │   │
+│   │  代码：region_event_handler.go:350-353                              │   │
+│   │  func handleResolvedTs(...) uint64 {                                │   │
+│   │      if state.isStale() || !state.isInitialized() {                 │   │
+│   │          return 0  // ← 增量扫期间不推进 resolvedTs                  │   │
+│   │      }                                                              │   │
+│   │      ...                                                            │   │
+│   │  }                                                                  │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  推流阶段（Initialized = true）                                      │   │
+│   │                                                                     │   │
+│   │  • TiKV 实时推送新写入的数据                                         │   │
+│   │  • 数据按 commitTs 时序到达                                          │   │
+│   │  • resolvedTs 正常推进                                               │   │
+│   │  • 下游正常消费                                                       │   │
+│   │                                                                     │   │
+│   │  代码：region_event_handler.go:278-289                              │   │
+│   │  case cdcpb.Event_INITIALIZED:                                      │   │
+│   │      state.setInitialized()  // ← 进入推流阶段                       │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**对 Memory Controller 的透明性**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    两个阶段对 Memory Controller 完全透明                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   增量扫和推流走完全相同的代码路径：                                          │
+│                                                                             │
+│   TiKV                                                                      │
+│     │                                                                       │
+│     │ gRPC Stream（增量扫 + 推流，都走这里）                                 │
+│     ▼                                                                       │
+│   region_request_worker.receiveAndDispatchChangeEvents()                   │
+│     │                                                                       │
+│     │ dispatchRegionChangeEvents()                                         │
+│     ▼                                                                       │
+│   subscriptionClient.pushRegionEventToDS()  ← Memory Controller 检查点      │
+│     │                                                                       │
+│     │ if paused → 阻塞等待                                                 │
+│     │ else → ds.Push(subID, event)                                         │
+│     ▼                                                                       │
+│   DynamicStream.pendingQueue  ← Memory Controller 统计的内存               │
+│     │                                                                       │
+│     ▼                                                                       │
+│   Handler.Handle() → consumeKVEvents() → eventCh.Push() → EventStore       │
+│                                                                             │
+│   ──────────────────────────────────────────────────────────────────────   │
+│                                                                             │
+│   关键：                                                                    │
+│   • 增量扫和推流都往 pendingQueue 写数据                                    │
+│   • 都受 80%/50% 阈值控制                                                  │
+│   • Memory Controller 不区分数据来源                                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**唯一区别：下游消费行为**
+
+| 阶段 | resolvedTs | 下游消费 | pendingQueue 释放 |
+|------|------------|----------|-------------------|
+| **增量扫** | 不推进 | 不消费 | 只依赖 EventStore 写入完成 |
+| **推流** | 正常推进 | 正常消费 | 正常 |
+
+**注意**：增量扫期间下游不消费，但 **EventStore 写入仍然正常进行**，所以 pendingQueue 仍然会释放（见 Q5 详细解释）。
+
+---
+
+#### Q5: 增量扫期间如果触发 Memory Controller 暂停，会不会死锁？
+
+**问题**：增量扫期间，如果 pendingQueue 内存超过 80% 触发暂停，同时因为 resolvedTs 不推进导致下游不消费，EventStore 会不会写不进去？callback 不调用？pendingQueue 不释放？形成死锁？
+
+**解答**：
+
+**不会死锁！** 只是变慢，不是卡死。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    完整的数据流和释放链                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   LogPuller                        EventStore                               │
+│   ──────────                       ──────────                               │
+│                                                                             │
+│   DynamicStream.pendingQueue       eventCh (UnlimitedChannel)              │
+│   ┌─────────────────────┐          ┌─────────────────────────┐             │
+│   │ ◄── Memory Controller         │  无限容量的缓冲区        │             │
+│   │     统计的内存               │  Push() 非阻塞！         │             │
+│   │                             │                          │             │
+│   │ 待处理的事件                 │  等待 writeWorker 消费   │             │
+│   └──────────┬──────────┘          └────────────┬────────────┘             │
+│              │                                   │                          │
+│              │ Handler.Handle()                  │ writeWorker              │
+│              │ consumeKVEvents()                 │                          │
+│              │ eventCh.Push() ─────────────────► │ GetMultipleNoGroup()     │
+│              │        [非阻塞，立即返回]          │                          │
+│              │                                   │                          │
+│              │ await=true,等待callback           │ writeEvents(PebbleDB)    │
+│              │                                   │                          │
+│              │ ◄─── callback() ──────────────────│ callback()               │
+│              │        [写入完成后调用]            │                          │
+│              ▼                                   ▼                          │
+│   pendingQueue 释放                    PebbleDB 持久化                      │
+│   pendingSize 减少                                                        │
+│   area 内存下降                                                            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**关键点 1：eventCh 是 UnlimitedChannel，Push 非阻塞**
+
+```go
+// utils/chann/unlimited_chann.go:67-80
+func (c *UnlimitedChannel[T, G]) Push(values ...T) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    for _, v := range values {
+        c.queue.PushBack(v)  // ← 直接 push，没有容量限制！
+    }
+    c.cond.Signal()
+}
+```
+
+**关键点 2：callback 在 PebbleDB 写入完成后调用**
+
+```go
+// logservice/eventstore/event_store.go:341-349
+if err = p.store.writeEvents(p.db, events, encoder); err != nil {
+    log.Panic("write events failed", zap.Error(err))
+}
+for idx := range events {
+    events[idx].callback()  // ← 写入完成后调用
+}
+```
+
+**为什么不会死锁？**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    实际的"卡顿"场景分析（不是死锁）                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   1. 增量扫开始，数据量很大                                                  │
+│      └── pendingQueue 内存 > 80%                                            │
+│      └── Memory Controller 暂停 LogPuller                                   │
+│                                                                             │
+│   2. pendingQueue 中的数据等待被处理                                        │
+│      └── Handler.Handle() → consumeKVEvents()                              │
+│      └── eventCh.Push() [非阻塞，立即完成]                                  │
+│      └── await=true，等待 callback                                         │
+│                                                                             │
+│   3. EventStore writeWorker 写入 PebbleDB                                   │
+│      └── 如果磁盘慢 → 写入慢 → callback 延迟                                │
+│      └── 如果磁盘快 → 写入快 → callback 很快                                │
+│                                                                             │
+│   4. callback() 调用后                                                      │
+│      └── pendingQueue 释放                                                  │
+│      └── area 内存下降                                                      │
+│      └── 降到 50% 以下 → Memory Controller 恢复                             │
+│                                                                             │
+│   5. LogPuller 恢复，增量扫继续                                             │
+│                                                                             │
+│   ──────────────────────────────────────────────────────────────────────   │
+│                                                                             │
+│   关键理解：                                                                 │
+│   • eventCh.Push() 非阻塞 → 不会卡在"写入 EventStore"这一步                │
+│   • PebbleDB 写入不依赖下游消费 → 下游不消费也能写入                        │
+│   • 等待时间 = PebbleDB 写入时间 → 只是变慢，不是死锁                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**瓶颈分析**：
+
+| 组件 | 瓶颈 | 影响 |
+|------|------|------|
+| **pendingQueue** | 内存 1GB | 触发 Memory Controller 暂停 |
+| **eventCh** | UnlimitedChannel，无限制 | 不会阻塞 |
+| **PebbleDB 写入** | 磁盘 IO | 如果磁盘慢，callback 延迟调用 |
+| **EventStore 存储** | 磁盘空间 | 如果下游长期不消费，存储会持续增长 |
+
+**优化建议**：
+
+| 方案 | 解决什么问题 | 效果 |
+|------|-------------|------|
+| **增加磁盘大小** | EventStore 存储无限增长（下游不消费时） | 防止磁盘满，但不会加快速度 |
+| **高速硬盘（SSD/NVMe）** | PebbleDB 写入慢，callback 延迟 | **直接加快释放速度，减少等待时间** |
+| **两者结合** | 综合优化 | 最佳方案 |
+
+**总结**：
+
+| 问题 | 答案 |
+|------|------|
+| 会死锁吗？ | ❌ 不会 |
+| 会卡顿吗？ | ✅ 会，等待 PebbleDB 写入 |
+| 等待时间 | 取决于磁盘 IO 速度 |
+| 下游不消费影响写入吗？ | ❌ 不影响 |
+| 真正的问题 | 下游长期不消费会导致 EventStore 存储无限增长 |
+
+---
+
+#### Q6: 如果一个 changefeed 的 area 超过 80%，所有表的 LogPuller 都会停下来吗？
 
 **问题**：上游的 paused 标志是全局的，如果 changefeed A 的 area 超过 80%，会不会导致 changefeed B、C、D 的上游也都停下来？
 
@@ -1348,7 +1584,7 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 
 ---
 
-#### Q4: 两种算法的实际运行机制有什么区别？
+#### Q7: 两种算法的实际运行机制有什么区别？
 
 **问题**：上游用 Puller 算法，下游用 EventCollector 算法，它们的实际运行机制有什么本质区别？
 
