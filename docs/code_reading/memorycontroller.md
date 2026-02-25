@@ -7,8 +7,11 @@
   - 上游：只有 Area 级别生效（80% 暂停/50% 恢复），没有 Path 级别的渐进式控制
   - 下游：不用 Pause/Resume，直接 ReleasePath 丢弃队列
   - **上游 paused 是全局的**：任何一个 changefeed 超过 80%，所有表都会暂停
+  - **⚠️ 设计问题一**：LogPuller 使用单一 Area（Area=0），一个慢订阅可能阻塞所有订阅
+  - **⚠️ 设计问题二**：EventStore 存储无大小限制，下游慢时可能导致磁盘空间耗尽
+  - 详见 [E. 设计问题分析](#e-single-area-blocking)
 - **适用场景**：理解 TiCDC 内存控制的实现原理和架构权衡
-- **阅读建议**：按目录阅读，先看架构概览，再看上下游链路，最后看算法对比和 FAQ
+- **阅读建议**：按目录阅读，先看架构概览，再看上下游链路，最后看算法对比、FAQ 和设计问题分析
 
 ---
 
@@ -32,6 +35,12 @@
   - [3 阈值与行为对比](#sec-c3-thresholds)
   - [4 常见问题解答](#sec-c4-faq)
   - [5 新架构其他变化](#sec-c5-new-arch)
+- [E. 设计问题分析：单 Area 导致全局阻塞](#e-single-area-blocking)
+  - [1 问题描述](#sec-e1-problem)
+  - [2 根因分析](#sec-e2-root-cause)
+  - [3 影响范围](#sec-e3-impact)
+  - [4 可能的优化方向](#sec-e4-optimization)
+  - [5 设计问题二：EventStore 存储无限制增长风险](#sec-e5-problem2)
 - [D. 术语汇总小节](#d-terminology)
 
 ---
@@ -185,6 +194,218 @@ TiCDC 进程
 3. **EventCollector 按 changefeed 划分**：每个 changefeed 有独立的 EventCollector 实例
 4. **Dispatcher 是表级别的**：一个 changefeed 包含多个表，每个表对应一个 Dispatcher
 5. **下游 memory control 的 Area/Path 映射**：Area → Changefeed，Path → Dispatcher (每个表一个 Path)
+
+### LogPuller 与 EventCollector 的 Area 组织方式对比
+
+**核心区别**：LogPuller 和 EventCollector 都有 Area 概念，但组织方式不同，这是由它们的"上下游"特性决定的。
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  TiCDC Server                                                           │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ LogPuller (全局单例)                                             │   │
+│  │                                                                   │   │
+│  │ 只有【一个上游】TiKV → 只需要【一个 Area】                        │   │
+│  │                                                                   │   │
+│  │ └── DynamicStream                                                │   │
+│  │     └── Area=0 (唯一 Area, 配额 1GB)                            │   │
+│  │         ├── Path (Changefeed A, Table 1)                        │   │
+│  │         ├── Path (Changefeed A, Table 2)                        │   │
+│  │         ├── Path (Changefeed B, Table 3)  ← 所有 changefeed 的  │   │
+│  │         └── Path (Changefeed C, Table 4)     订阅都在这里       │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                              ↓ 数据流                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ EventCollector (全局单例)                                        │   │
+│  │                                                                   │   │
+│  │ 可能有【多个下游】changefeed → 需要【多个 Area】隔离              │   │
+│  │                                                                   │   │
+│  │ └── DynamicStream                                                │   │
+│  │     ├── Area=ChangefeedA (配额 1GB)                             │   │
+│  │     │   ├── Path (Table 1)                                      │   │
+│  │     │   └── Path (Table 2)                                      │   │
+│  │     ├── Area=ChangefeedB (配额 1GB)  ← 每个 changefeed 独立     │   │
+│  │     │   └── Path (Table 3)                                      │   │
+│  │     └── Area=ChangefeedC (配额 1GB)                             │   │
+│  │         └── Path (Table 4)                                      │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**代码对比：**
+
+| | LogPuller | EventCollector |
+|---|---|---|
+| **上游/下游** | 只有一个上游 (TiKV) | 多个下游 (多个 changefeed) |
+| **GetArea 实现** | `return 0` (硬编码) | `return changefeedID.ID()` |
+| **Area 数量** | 1 个 (Area=0) | N 个 (每个 changefeed 一个) |
+| **代码位置** | `logpuller/region_event_handler.go:172` | `eventcollector/helper.go:157` |
+
+```golang
+// LogPuller: 硬编码返回 0，所有订阅在同一 Area
+// logservice/logpuller/region_event_handler.go:172-174
+func (h *regionEventHandler) GetArea(path SubscriptionID, dest *subscribedSpan) int {
+    return 0
+}
+
+// EventCollector: 按 changefeedID 划分 Area
+// downstreamadapter/eventcollector/helper.go:157-159
+func (h *EventsHandler) GetArea(path common.DispatcherID, dest *dispatcherStat) common.GID {
+    return dest.target.GetChangefeedID().ID()
+}
+```
+
+**设计意图**：
+- **LogPuller**：只有一个数据源（TiKV），所有表的数据都从同一个上游拉取，共享一个内存池是合理的
+- **EventCollector**：有多个独立的下游（changefeed），每个 changefeed 可能写入不同的目标，需要隔离避免相互影响
+
+**⚠️ 设计问题**：LogPuller 虽然只有一个上游，但服务于多个 changefeed。当某个 changefeed 消费慢时，其订阅的内存会在 Area=0 中累积，可能导致 Area 总内存超阈值，从而阻塞所有 changefeed 的上游订阅。详见 [E. 设计问题分析](#e-single-area-blocking)。
+
+### 数据生命周期与清理机制
+
+TiCDC 不是无限存储，各组件都有对应的清理机制：
+
+#### 完整数据流
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                   完整数据流与清理机制                                         │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   TiKV                                                                                      │
+│     │                                                                                       │
+│     │ gRPC Stream (Pull 模式)                                                               │
+│     ▼                                                                                       │
+│   LogPuller ────────────────────────────────────────────────────────────────────────────    │
+│     │ pendingQueue (内存)                                                                   │
+│     │ await=true 时阻塞，等待 EventStore 写入完成                                            │
+│     ▼                                                                                       │
+│   EventStore ────────────────────────────────────────────────────────────────────────────   │
+│     │ PebbleDB (持久化存储)                                                                 │
+│     │ GC 机制：删除 < checkpointTs 的数据                                                   │
+│     │                                                                                       │
+│     │ GetIterator (扫描)                                                                    │
+│     ▼                                                                                       │
+│   EventService ───────────────────────────────────────────────────────────────────────────  │
+│     │ scanWorker 扫描数据                                                                   │
+│     │ Push 模式推送（不等待 ACK）                                                           │
+│     ▼                                                                                       │
+│   EventCollector ────────────────────────────────────────────────────────────────────────── │
+│     │ DynamicStream (内存)                                                                  │
+│     │ ReleasePath 丢弃 → 可从 EventStore 重新拉取                                           │
+│     ▼                                                                                       │
+│   Dispatcher ─────────────────────────────────────────────────────────────────────────────  │
+│     │ 处理数据，写入下游                                                                     │
+│     │ 更新 checkpointTs                                                                     │
+│     ▼                                                                                       │
+│   Sink (MySQL/Kafka)                                                                        │
+│                                                                                             │
+│   ──────────────────────────────────────────────────────────────────────────────────────    │
+│   checkpointTs 更新 → EventStore GC → 清理已消费数据                                         │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 各组件清理机制
+
+| 组件 | 存储类型 | 清理机制 |
+|------|---------|---------|
+| **LogPuller pendingQueue** | 内存 | 事件被 EventStore 持久化后，callback 触发清除 |
+| **EventStore** | PebbleDB | 基于 checkpointTs 的 GC，定期删除已消费数据 |
+| **EventCollector** | 内存 | ReleasePath 丢弃（可从 EventStore 恢复） |
+
+#### LogPuller pendingQueue 生命周期
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              LogPuller pendingQueue 的生命周期                               │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   Step 1: 数据入队（pendingSize 增加）                                                        │
+│   ────────────────────────────────                                                          │
+│   TiKV → pushRegionEventToDS → DynamicStream.handleLoop                                     │
+│       → appendEvent → pendingQueue.PushBack + pendingSize 增加                              │
+│   代码：memory_control.go:152-155                                                            │
+│                                                                                             │
+│   Step 2: 数据写入 EventStore（await 等待）                                                   │
+│   ──────────────────────────────────────                                                     │
+│   Handler.Handle() → consumeKVEvents → eventCh.Push(eventWithCallback)                      │
+│       → 返回 true (await) → path.blocking = true                                            │
+│   代码：event_store.go:603-611, region_event_handler.go:143                                  │
+│                                                                                             │
+│   Step 3: EventStore 写入 PebbleDB                                                           │
+│   ──────────────────────────────────                                                         │
+│   writeWorker → writeEvents(db, events) → batch.Commit()                                    │
+│   代码：event_store.go:341-349                                                               │
+│                                                                                             │
+│   Step 4: 写入完成，调用 callback（pendingSize 减少）                                          │
+│   ──────────────────────────────────────────                                                 │
+│   events[idx].callback() → finishCallback → wakeSubscription                                │
+│       → wakePath(path) → path.blocking = false                                              │
+│       → pendingQueue.PopFront + pendingSize 减少                                             │
+│   代码：event_store.go:348-349, event_queue.go:94-100                                        │
+│                                                                                             │
+│   ⚠️ 关键：数据必须先写入 EventStore（PebbleDB 持久化），                                       │
+│           然后 callback 被调用，LogPuller 的 pendingQueue 才能清除                             │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### EventStore GC 机制
+
+EventStore 基于 **checkpointTs** 清理已消费的数据：
+
+```golang
+// event_store.go:734-747 - 当 checkpointTs 更新时，添加 GC item
+if lastReceiveDMLTime > 0 {
+    e.gcManager.addGCItem(
+        subStat.dbIndex,
+        uint64(subStat.subID),
+        subStat.tableSpan.TableID,
+        oldCheckpointTs,    // ← 删除范围的起点
+        newCheckpointTs,    // ← 删除范围的终点
+    )
+}
+
+// gc.go:98-166 - gcManager 定期执行删除（每 50ms）
+deleteTicker := time.NewTicker(50 * time.Millisecond)
+for {
+    select {
+    case <-deleteTicker.C:
+        ranges := d.fetchAllGCItems()
+        d.doGCJob(ranges)  // ← 删除 (oldCheckpointTs, newCheckpointTs] 范围的数据
+    }
+}
+```
+
+**GC 触发流程**：
+1. Dispatcher 处理完数据后，更新 checkpointTs
+2. EventStore 收到 checkpointTs 更新，添加 GC item
+3. gcManager 定期执行删除，清理已消费的数据
+
+#### EventService 扫描消费机制
+
+EventService（eventBroker）负责从 EventStore 扫描数据推送给 EventCollector：
+
+```golang
+// pkg/eventservice/event_broker.go:297-305
+func (c *eventBroker) runScanWorker(ctx context.Context, taskChan chan scanTask) error {
+    for {
+        select {
+        case task := <-taskChan:
+            c.doScan(ctx, task)  // ← 扫描并推送
+        }
+    }
+}
+```
+
+**扫描流程**：
+1. `getScanTaskDataRange(task)` → 获取要扫描的范围 `[sentResolvedTs, resolvedTs]`
+2. `eventStore.GetIterator(dispatcherID, dataRange)` → 从 PebbleDB 扫描数据
+3. 封装成 DMLEvent/DDLEvent
+4. 通过 messaging **Push 模式**推送给 EventCollector（不等待 ACK）
 
 ### 关键设计决策
 
@@ -1202,6 +1423,510 @@ func NewCDCBaseKey(clusterID string) string {
     return fmt.Sprintf("/tidb/cdc_new/%s", clusterID)
 }
 ```
+
+---
+
+<a id="e-single-area-blocking"></a>
+## E. 设计问题分析：单 Area 导致全局阻塞
+
+summary：
+- **文档范围**
+    - 分析 LogPuller 的 DynamicStream 使用单一 Area 导致的全局阻塞问题。
+- **问题描述**
+    - LogPuller 的 DynamicStream 只有一个 Area（Area=0），所有订阅共享。
+    - 当 Area 总内存超过 80%（800MB），会暂停所有订阅的推送。
+    - 一个慢订阅可能导致所有订阅（包括正常的）被阻塞。
+- **根因分析**
+    - `GetArea()` 硬编码返回 0，所有 path 被归入同一 Area。
+    - `paused` 标志是全局的，没有按订阅/changefeed 隔离。
+- **影响范围**
+    - 多 changefeed 场景下，一个 changefeed 的 EventStore 写入瓶颈可能影响其他 changefeed。
+    - 注意：下游 Sink 慢不会影响 LogPuller，只会影响 EventCollector。
+    - 按 changefeed 或订阅划分 Area，实现隔离控制。
+    - 实现 Path 级别的渐进式控制（先暂停部分 path）。
+
+---
+
+<a id="sec-e1-problem"></a>
+### 1 问题描述
+
+**核心问题**：LogPuller 的 DynamicStream 使用**单一的 Area（Area=0）** 来管理所有订阅，当 Area 的总内存使用超过阈值时，会**阻塞所有订阅**，而不仅仅是内存超标的订阅。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              问题场景：一个慢订阅阻塞所有订阅                                │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   subscriptionClient (全局单例)                                                             │
+│   │                                                                                         │
+│   ├── DynamicStream (只有一个 Area=0, 配额 1GB)                                            │
+│   │   │                                                                                     │
+│   │   ├── Path 1: Changefeed A, Table 1 (pendingSize: 100MB)                               │
+│   │   ├── Path 2: Changefeed A, Table 2 (pendingSize: 50MB)                                │
+│   │   ├── Path 3: Changefeed B, Table 3 (pendingSize: 600MB) ← 慢订阅，内存堆积            │
+│   │   ├── Path 4: Changefeed B, Table 4 (pendingSize: 100MB)                               │
+│   │   └── Path 5: Changefeed C, Table 5 (pendingSize: 50MB)                                │
+│   │                                                                                         │
+│   │   totalPendingSize = 900MB (90% > 80%) → 触发 PauseArea                                │
+│   │                                                                                         │
+│   └── paused = true  ← ⚠️ 全局暂停！所有订阅都被阻塞                                        │
+│                                                                                             │
+│   结果：                                                                                     │
+│   • Changefeed C 正常消费，但也被阻塞 ← ⚠️ 无辜受影响                                        │
+│   • Changefeed A 正常消费，但也被阻塞                                                        │
+│   • Changefeed B 慢消费，是根因，但所有订阅都受影响                                           │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+<a id="sec-e2-root-cause"></a>
+### 2 根因分析
+
+#### 2.1 GetArea 硬编码返回 0
+
+所有订阅的 path 都被归入同一个 Area（Area=0）：
+
+```golang
+// logservice/logpuller/region_event_handler.go:172-174
+func (h *regionEventHandler) GetArea(path SubscriptionID, dest *subscribedSpan) int {
+    return 0  // ← 硬编码返回 0，所有 path 都在 Area=0
+}
+```
+
+#### 2.2 paused 标志是全局的
+
+`subscriptionClient` 只有一个 `paused` 标志，所有订阅共享：
+
+```golang
+// logservice/logpuller/subscription_client.go:197
+paused atomic.Bool  // ← 全局唯一的暂停标志
+```
+
+#### 2.3 PauseArea 影响 Area 内所有 path
+
+当 Area 内存超过阈值，发送 `PauseArea` feedback，阻塞该 Area 内所有 path：
+
+```golang
+// logservice/logpuller/subscription_client.go:425-429
+case feedback := <-s.ds.Feedback():
+    switch feedback.FeedbackType {
+    case dynstream.PauseArea:
+        s.paused.Store(true)   // ← 设置全局暂停标志
+    ...
+    }
+
+// logservice/logpuller/subscription_client.go:405-413
+func (s *subscriptionClient) pushRegionEventToDS(subID SubscriptionID, event regionEvent) {
+    if !s.paused.Load() {
+        s.ds.Push(subID, event)
+        return
+    }
+    // ← 所有订阅都会在这里阻塞
+    s.mu.Lock()
+    for s.paused.Load() {
+        s.cond.Wait()
+    }
+    ...
+}
+```
+
+#### 2.4 代码验证：只允许一个 Area
+
+代码中明确检查了 Area 数量，超过一个会 panic：
+
+```golang
+// logservice/logpuller/subscription_client.go:296-298
+if len(dsMetrics.MemoryControl.AreaMemoryMetrics) > 1 {
+    log.Panic("subscription client should have only one area")
+}
+```
+
+---
+
+<a id="sec-e3-impact"></a>
+### 3 影响范围
+
+#### 3.1 影响场景
+
+| 场景 | 是否受影响 | 说明 |
+|------|-----------|------|
+| 单 changefeed | ✅ 正常工作 | 只有一个 Area，设计预期行为 |
+| 多 changefeed（均衡） | ✅ 正常工作 | 总内存不超阈值即可 |
+| **多 changefeed（一个 EventStore 写入慢）** | ❌ **有问题** | 某个订阅的 pendingQueue 增长可能拖垮所有订阅 |
+| 多 changefeed（一个 Sink 慢） | ✅ 正常工作 | Sink 慢只影响 EventCollector，不回溯到 LogPuller |
+
+#### 3.2 慢订阅的来源
+
+慢订阅可能由以下原因导致：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              慢订阅的常见原因                                                 │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   ⚠️ 会导致 LogPuller pendingQueue 增长的原因：                                               │
+│                                                                                             │
+│   1. EventStore 写入慢（主要原因）                                                            │
+│      ────────────────────────────                                                            │
+│      • PebbleDB 写入瓶颈                                                                    │
+│      • 磁盘 IO 瓶颈                                                                          │
+│      • writeTaskPool 积压 → finishCallback 延迟调用                                         │
+│      • consumeKVEvents 返回 await=true 后，wakeCallback 没被及时调用                         │
+│                                                                                             │
+│   2. 数据热点                                                                                │
+│      ──────────                                                                             │
+│      • 某个表数据量特别大                                                                    │
+│      • 该表的 region 请求特别多                                                              │
+│                                                                                             │
+│   ────────────────────────────────────────────────────────────────────────────────────────   │
+│                                                                                             │
+│   ✅ 不会导致 LogPuller pendingQueue 增长的原因：                                             │
+│                                                                                             │
+│   3. 下游 Sink 写入慢                                                                        │
+│      ──────────────────                                                                     │
+│      • Sink (MySQL/Kafka) 写入性能差                                                        │
+│      • 网络延迟高                                                                            │
+│      • 下游负载高                                                                            │
+│      • 影响：只导致 EventCollector 内存增长，触发 ReleasePath                                │
+│      • ⚠️ 不会回溯到 LogPuller                                                              │
+│                                                                                             │
+│   4. EventCollector 内存压力大                                                               │
+│      ──────────────────────────                                                             │
+│      • EventCollector 的 DynamicStream 队列堆积                                              │
+│      • 触发 ReleasePath 丢弃事件，然后从 EventStore 重新拉取                                 │
+│      • ⚠️ 不会回溯到 LogPuller                                                              │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.3 背压传导链（修正版）
+
+**关键理解**：下游 Sink 慢不会直接导致 LogPuller 阻塞，真正的阻塞链路是 EventStore 处理瓶颈。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                          正确的阻塞链路（EventStore 瓶颈导致）                                 │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   Step 1: LogPuller 从 TiKV 收到数据                                                         │
+│   ─────────────────────────────────────                                                      │
+│   • 每个 SubscriptionID 发送独立的 region 请求（带 RequestId）                                │
+│   • TiKV 返回事件带 RequestId，分发到对应 path                                               │
+│   代码：region_request_worker.go:413 (RequestId), :236 (subscriptionID)                     │
+│                                                                                             │
+│   Step 2: DynamicStream 入队（此时 pendingSize 已增加）                                       │
+│   ─────────────────────────────────────────────────                                           │
+│   • path.pendingQueue.PushBack(event)                                                       │
+│   • path.updatePendingSize() / area.totalPendingSize.Add()                                  │
+│   代码：memory_control.go:152-155                                                            │
+│                                                                                             │
+│   Step 3: Handler.Handle() 调用 consumeKVEvents，返回 await=true                             │
+│   ─────────────────────────────────────────────────────────                                   │
+│   • 将事件推入 EventStore.eventCh                                                           │
+│   • 返回 true，表示需要等待 wakeCallback                                                     │
+│   代码：event_store.go:603-611, region_event_handler.go:143-155                              │
+│                                                                                             │
+│   Step 4: path 进入 blocking 状态（不影响新事件入队）                                         │
+│   ─────────────────────────────────────────────────                                           │
+│   • path.blocking.Store(true)                                                               │
+│   • 新事件还在入队（Step 2），但旧事件没被消费                                               │
+│   代码：event_queue.go:90-91                                                                │
+│                                                                                             │
+│   Step 5: EventStore write worker 写入 PebbleDB，完成后调用 callback                         │
+│   ─────────────────────────────────────────────────────────────                               │
+│   • 如果写入慢 → finishCallback 延迟调用 → wakeSubscription 延迟                             │
+│   代码：event_store.go:341-349                                                              │
+│                                                                                             │
+│   Step 6: pendingQueue 持续增长 → Area 内存超过 80%                                          │
+│   ─────────────────────────────────────────────────                                           │
+│   • 某个 path 长时间 blocking，pendingSize 累积                                              │
+│   • Area 总 pendingSize 超过阈值                                                            │
+│                                                                                             │
+│   Step 7: ⚠️ PauseArea → 所有订阅被阻塞                                                      │
+│   ─────────────────────────────                                                              │
+│   • s.paused.Store(true)                                                                    │
+│   • pushRegionEventToDS 会 cond.Wait() 阻塞                                                 │
+│   • LogPuller 不再从 TiKV 接收新数据                                                        │
+│   代码：subscription_client.go:405-413                                                       │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**不会导致 LogPuller 阻塞的场景**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                          Sink 慢的影响范围（不会回溯到 LogPuller）                             │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   Sink 写入慢                                                                               │
+│       ↓                                                                                     │
+│   Dispatcher 处理慢                                                                         │
+│       ↓                                                                                     │
+│   EventCollector 的 DynamicStream 队列堆积                                                   │
+│       ↓                                                                                     │
+│   EventCollector Area 内存超过阈值                                                           │
+│       ↓                                                                                     │
+│   ⚠️ ReleasePath → 丢弃事件，从 EventStore 重新拉取                                          │
+│       ↓                                                                                     │
+│   影响范围：仅限于该 changefeed，不会回溯到 LogPuller                                        │
+│                                                                                             │
+│   原因：EventService 是 Push 模式，不等待 ACK；EventStore 持久化后数据就安全了                │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+<a id="sec-e4-optimization"></a>
+### 4 可能的优化方向
+
+#### 4.1 方向一：按 changefeed 划分 Area
+
+将 Area 的粒度从"全局"改为"changefeed 级别"：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              优化方向一：按 changefeed 划分 Area                              │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   优化前：                                                                                   │
+│   subscriptionClient                                                                        │
+│   └── DynamicStream (Area=0, 所有订阅)                                                      │
+│       └── paused=true → 所有订阅都被阻塞                                                    │
+│                                                                                             │
+│   优化后：                                                                                   │
+│   subscriptionClient                                                                        │
+│   └── DynamicStream                                                                         │
+│       ├── Area=ChangefeedA (配额 500MB)  ← 独立控制                                         │
+│       │   └── pausedA=true → 只阻塞 Changefeed A                                           │
+│       ├── Area=ChangefeedB (配额 500MB)  ← 独立控制                                         │
+│       │   └── pausedB=true → 只阻塞 Changefeed B                                           │
+│       └── Area=ChangefeedC (配额 500MB)  ← 独立控制                                         │
+│           └── pausedC=false → Changefeed C 正常运行                                         │
+│                                                                                             │
+│   实现要点：                                                                                 │
+│   • 修改 GetArea() 返回 changefeedID 而非硬编码 0                                           │
+│   • 需要在 regionEventHandler 中获取 changefeed 信息                                        │
+│   • 每个 Area 有独立的 paused 状态和配额                                                    │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**优点**：
+- 实现了 changefeed 级别的隔离
+- 一个 changefeed 的问题不会影响其他 changefeed
+
+**挑战**：
+- 需要修改 `GetArea()` 的实现，传递 changefeed 上下文
+- 需要为每个 Area 分配独立的配额
+- 当前 `subscriptionClient` 的 `paused` 标志需要改为按 Area 管理
+
+#### 4.2 方向二：实现 Path 级别的渐进式控制
+
+在 Area 暂停之前，先暂停部分内存占用高的 Path：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              优化方向二：Path 级别渐进式控制                                  │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   当前行为：                                                                                 │
+│   Area 内存 > 80% → 立即 PauseArea（全有或全无）                                            │
+│                                                                                             │
+│   优化后：                                                                                   │
+│   Area 内存 > 60% → 暂停 top-N 内存占用高的 Path                                            │
+│   Area 内存 > 80% → 暂停所有 Path (PauseArea)                                               │
+│   Area 内存 < 50% → 恢复所有 Path (ResumeArea)                                              │
+│                                                                                             │
+│   实现要点：                                                                                 │
+│   • 激活 Puller 算法中已定义但未使用的 ShouldPausePath 逻辑                                  │
+│   • 在 updateAreaPauseState 中增加 Path 级别判断                                            │
+│   • 按 pendingSize 排序，优先暂停内存占用高的 Path                                          │
+│                                                                                             │
+│   现有代码基础：                                                                             │
+│   // utils/dynstream/memory_control_algorithm.go:43-76                                     │
+│   // Path 级别阈值已定义但未调用：                                                           │
+│   if memoryUsageRatio >= 0.2 { ... pause path ... }                                        │
+│   if memoryUsageRatio < 0.1 { ... resume path ... }                                        │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**优点**：
+- 渐进式控制，减少全局暂停的频率
+- 利用现有算法定义，实现成本较低
+
+**挑战**：
+- 需要修改 `memory_control.go` 的 `updateAreaPauseState` 逻辑
+- 需要实现 Path 级别的 PausePath/ResumePath feedback
+- LogPuller 需要处理 Path 级别的反馈
+
+#### 4.3 方向三：全局配额 + 按比例暂停
+
+保持单一 Area，但根据各订阅的内存占用比例，优先暂停占用高的订阅：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              优化方向三：按比例优先暂停                                       │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   思路：                                                                                     │
+│   • 统计各订阅的 pendingSize 占 Area 总内存的比例                                            │
+│   • 当 Area 内存超过阈值时，优先暂停占用比例最高的订阅                                       │
+│   • 按需逐步暂停更多订阅，直到内存下降                                                       │
+│                                                                                             │
+│   示例：                                                                                     │
+│   Area 总内存 900MB (90%)                                                                   │
+│   ├── Changefeed A: 100MB (11%) → 正常                                                     │
+│   ├── Changefeed B: 700MB (78%) → ⚠️ 优先暂停这个                                          │
+│   └── Changefeed C: 100MB (11%) → 正常                                                     │
+│                                                                                             │
+│   实现：                                                                                     │
+│   • 维护订阅级别的 pendingSize 统计                                                         │
+│   • Pause 时选择 top-K 占用订阅暂停                                                         │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**优点**：
+- 保持单一 Area 的架构
+- 只影响问题订阅，正常订阅不受影响
+
+**挑战**：
+- 需要实现订阅级别的暂停机制
+- `paused` 标志需要改为订阅级别
+
+#### 4.4 方案对比
+
+| 方案 | 隔离级别 | 实现复杂度 | 对现有架构改动 |
+|------|---------|-----------|--------------|
+| 按 changefeed 划分 Area | changefeed | 中 | 大 |
+| Path 级别渐进式控制 | path (表) | 中 | 中 |
+| 按比例优先暂停 | 订阅 | 低 | 中 |
+
+---
+
+<a id="sec-e5-problem2"></a>
+### 5 设计问题二：EventStore 存储无限制增长风险
+
+#### 5.1 问题描述
+
+**核心问题**：EventStore 使用 PebbleDB 持久化存储数据，但**没有主动的大小限制机制**。当下游处理慢、checkpointTs 不更新时，EventStore 存储可能持续增长，存在磁盘空间耗尽的风险。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              存储无限增长场景                                                 │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   触发条件：                                                                                 │
+│   • 下游 Sink 处理慢 → Dispatcher 不更新 checkpointTs                                        │
+│   • LogPuller 写入顺畅 → Area 内存不超 80%，不暂停                                           │
+│   • EventStore 写入快 → 磁盘性能好，不阻塞 LogPuller                                         │
+│                                                                                             │
+│   结果：                                                                                     │
+│   ┌─────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                                     │   │
+│   │   LogPuller          EventStore                    下游                             │   │
+│   │   (Area 1GB)         (无大小限制)                  (慢)                             │   │
+│   │                                                                                     │   │
+│   │   ┌─────────┐       ┌─────────────────┐           ┌─────────┐                       │   │
+│   │   │ 数据入队 │ ───▶ │ 写入 PebbleDB   │ ──Push──▶ │ 处理慢  │                       │   │
+│   │   │ pending │       │ 存储持续增长 ⚠️  │           │ 不更新  │                       │   │
+│   │   │ Queue   │       │                 │           │checkpoint│                      │   │
+│   │   │         │       │ ⚠️ 没有大小限制   │           │   Ts    │                       │   │
+│   │   │ ✅ 不超  │       │ ⚠️ GC 不触发     │           │         │                       │   │
+│   │   │ 80%阈值 │       │                 │           │         │                       │   │
+│   │   └─────────┘       └─────────────────┘           └─────────┘                       │   │
+│   │                                                                                     │   │
+│   │   ────────────────────────────────────────────────────────────────────────────────  │   │
+│   │   ⚠️ 风险：磁盘空间耗尽                                                              │   │
+│   │                                                                                     │   │
+│   └─────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.2 根因分析
+
+**EventStore 只有监控，没有限制**：
+
+```golang
+// event_store.go:1146-1155 - 只有 metrics，没有大小限制检查
+func (e *eventStore) collectAndReportStoreMetrics() {
+    for i, db := range e.dbs {
+        stats := db.Metrics()
+        metrics.EventStoreOnDiskDataSizeGauge.WithLabelValues(id).Set(float64(diskSpaceUsage(stats)))
+        // ⚠️ 只是记录 metrics，没有大小限制检查或限流
+    }
+}
+```
+
+**GC 依赖 checkpointTs 更新**：
+
+```golang
+// event_store.go:734-747 - GC 由 checkpointTs 驱动
+if lastReceiveDMLTime > 0 {
+    e.gcManager.addGCItem(
+        subStat.dbIndex,
+        uint64(subStat.subID),
+        subStat.tableSpan.TableID,
+        oldCheckpointTs,    // ← 删除范围起点
+        newCheckpointTs,    // ← 删除范围终点（依赖下游更新）
+    )
+}
+```
+
+**问题**：如果 checkpointTs 不更新，GC 就不会清理数据，存储持续增长。
+
+#### 5.3 现有保护机制
+
+| 保护层 | 机制 | 代码位置 | 效果 |
+|--------|------|---------|------|
+| **LogPuller 内存** | Area 1GB 限制 | `subscription_client.go` | 如果 EventStore 写入慢，会触发暂停 |
+| **TiKV GC safepoint** | 基于 checkpointTs | `pkg/txnutil/gc/` | 防止上游数据丢失，但 TiKV 存储也会增长 |
+| **磁盘监控** | EventStoreOnDiskDataSizeGauge | `event_store.go:1151` | 仅监控，不主动限流 |
+| **磁盘满** | 操作系统层错误 | - | 硬错误，可能导致崩溃 |
+
+#### 5.4 风险场景
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              高风险场景                                                      │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   1. 大流量 + 下游慢                                                                         │
+│      • 上游写入量大，LogPuller 持续拉取                                                      │
+│      • 下游 Kafka/MySQL 处理慢，checkpointTs 不更新                                          │
+│      • LogPuller 内存不超阈值（因为 EventStore 写入快）                                      │
+│      • ⚠️ EventStore 存储持续增长                                                           │
+│                                                                                             │
+│   2. 磁盘性能好 + 下游慢                                                                     │
+│      • SSD 磁盘写入快，EventStore 不阻塞 LogPuller                                          │
+│      • 下游网络慢或下游服务有问题                                                            │
+│      • ⚠️ EventStore 存储持续增长，直到磁盘满                                                │
+│                                                                                             │
+│   3. 多 changefeed 场景                                                                     │
+│      • 一个 changefeed 下游慢，checkpointTs 不更新                                           │
+│      • 其他 changefeed 正常，但在同一 EventStore                                             │
+│      • ⚠️ 整个 EventStore 存储增长（数据共享存储）                                            │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.5 可能的优化方向
+
+| 方向 | 描述 | 复杂度 |
+|------|------|--------|
+| **添加存储配额** | 为 EventStore 设置最大存储限制，超过时拒绝写入或触发暂停 | 中 |
+| **存储压力反馈** | 当存储接近上限时，主动通知 LogPuller 暂停 | 中 |
+| **更积极的 GC** | 即使 checkpointTs 不更新，也基于时间/大小触发部分清理 | 高 |
+| **隔离存储** | 为每个 changefeed 分配独立的存储配额 | 高 |
+| **告警机制** | 存储超过阈值时主动告警（当前只有 metrics） | 低 |
+
+**推荐方案**：添加存储配额 + 存储压力反馈机制，当 EventStore 存储接近上限时，主动触发 LogPuller 暂停，形成闭环控制。
 
 ---
 
