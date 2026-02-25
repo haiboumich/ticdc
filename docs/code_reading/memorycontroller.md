@@ -33,8 +33,15 @@
   - [1 设计理念与角色定位](#sec-c1-design)
   - [2 架构图与时序图](#sec-c2-diagrams)
   - [3 阈值与行为对比](#sec-c3-thresholds)
-  - [4 常见问题解答](#sec-c4-faq)
-  - [5 新架构其他变化](#sec-c5-new-arch)
+  - [4 新架构其他变化](#sec-c4-new-arch)
+- [D. 常见问题解答](#d-faq)
+  - [Q1: Puller 算法会不会永远 hang 住？](#q1-puller-hang)
+  - [Q2: EventCollector 直接 release 了，数据不会丢失吗？](#q2-eventcollector-release)
+  - [Q3: 两种算法为什么不能互换？](#q3-algorithm-swap)
+  - [Q4: LogPuller 的增量扫和推流阶段对 Memory Controller 有影响吗？](#q4-incremental-scan)
+  - [Q5: 增量扫期间如果触发 Memory Controller 暂停，会不会死锁？](#q5-deadlock)
+  - [Q6: 如果一个 changefeed 的 area 超过 80%，所有表的 LogPuller 都会停下来吗？](#q6-global-pause)
+  - [Q7: 两种算法的实际运行机制有什么区别？](#q7-runtime-diff)
 - [E. 设计问题分析：单 Area 导致全局阻塞](#e-single-area-blocking)
   - [1 问题描述](#sec-e1-problem)
   - [2 根因分析](#sec-e2-root-cause)
@@ -42,7 +49,7 @@
   - [4 可能的优化方向](#sec-e4-optimization)
   - [5 设计问题二：EventStore 存储无限制增长风险](#sec-e5-problem2)
   - [6 场景分析：一个 path 影响全局的实际影响](#sec-e6-scenario)
-- [D. 术语汇总小节](#d-terminology)
+- [F. 术语汇总小节](#f-terminology)
 
 ---
 
@@ -1053,9 +1060,10 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 
 ---
 
-<a id="sec-c4-faq"></a>
-### 4 常见问题解答
+<a id="d-faq"></a>
+## D. 常见问题解答
 
+<a id="q1-puller-hang"></a>
 #### Q1: Puller 算法会不会永远 hang 住？
 
 **问题**：假设 area 超过 80% 一直不下来，LogPuller 是不是就一直 hang 住了？
@@ -1120,6 +1128,7 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 
 ---
 
+<a id="q2-eventcollector-release"></a>
 #### Q2: EventCollector 直接 release 了，数据不会丢失吗？上游怎么知道扔掉了？
 
 **问题**：EventCollector 算法直接清空队列丢弃事件，数据不会丢失吗？上游（EventService）怎么知道数据被扔掉了？
@@ -1252,6 +1261,7 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 
 ---
 
+<a id="q3-algorithm-swap"></a>
 #### Q3: 两种算法为什么不能互换？
 
 **问题**：为什么 LogPuller 不能用 ReleasePath，EventCollector 不能用 Pause/Resume？
@@ -1307,6 +1317,7 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 
 ---
 
+<a id="q4-incremental-scan"></a>
 #### Q4: LogPuller 的增量扫和推流阶段对 Memory Controller 有影响吗？
 
 **问题**：LogPuller 有增量扫（Incremental Scan）和推流（Streaming）两个阶段，这两个阶段对 Memory Controller 的行为有区别吗？
@@ -1410,6 +1421,7 @@ DynamicStream 是一个**通用事件处理框架**，为不同使用场景提�
 
 ---
 
+<a id="q5-deadlock"></a>
 #### Q5: 增量扫期间如果触发 Memory Controller 暂停，会不会死锁？
 
 **问题**：增量扫期间，如果 pendingQueue 内存超过 80% 触发暂停，同时因为 resolvedTs 不推进导致下游不消费，EventStore 会不会写不进去？callback 不调用？pendingQueue 不释放？形成死锁？
@@ -1543,6 +1555,7 @@ for idx := range events {
 
 ---
 
+<a id="q6-global-pause"></a>
 #### Q6: 如果一个 changefeed 的 area 超过 80%，所有表的 LogPuller 都会停下来吗？
 
 **问题**：上游的 paused 标志是全局的，如果 changefeed A 的 area 超过 80%，会不会导致 changefeed B、C、D 的上游也都停下来？
@@ -1584,6 +1597,7 @@ for idx := range events {
 
 ---
 
+<a id="q7-runtime-diff"></a>
 #### Q7: 两种算法的实际运行机制有什么区别？
 
 **问题**：上游用 Puller 算法，下游用 EventCollector 算法，它们的实际运行机制有什么本质区别？
@@ -1632,8 +1646,8 @@ for idx := range events {
 
 ---
 
-<a id="sec-c5-new-arch"></a>
-### 5 新架构其他变化
+<a id="sec-c4-new-arch"></a>
+### 4 新架构其他变化
 
 除了 memory controller，新架构还有以下关键变化：
 
@@ -2385,8 +2399,8 @@ case feedback := <-s.ds.Feedback():
 
 ---
 
-<a id="d-terminology"></a>
-## D. 术语汇总小节
+<a id="f-terminology"></a>
+## F. 术语汇总小节
 
 - **DynamicStream**：通用事件处理框架，提供事件分发、队列管理、内存控制能力。
     - **本身不处理业务逻辑**，只提供基础设施能力。
