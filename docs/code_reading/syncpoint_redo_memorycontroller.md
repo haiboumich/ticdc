@@ -17,6 +17,9 @@
 **PR 标题**: `*:improve memory control`
 **状态**: OPEN（未合并）
 **作者**: dongmen (asddongmen)
+**Issue**: close #4172
+**变更规模**: +2,154 -54，26 个文件，36 commits
+**最新更新**: 2026-02-13（CodeRabbit AI 评审完成）
 
 **关键问题**: 当前 memory controller 无法对齐 dispatcher 进度，导致快慢 dispatcher 进度差非常大，在遇到 syncpoint 这种需要对齐进度的 event 时会导致性能严重影响。
 
@@ -171,6 +174,148 @@ func TestCongestionControlMarshalUnmarshalEdgeCases(t *testing.T) {
 
 ---
 
+## PR #4030 最新变动分析（2026-02-26 更新）
+
+### 本地代码 vs PR 差异对比
+
+| 组件 | 本地代码（master） | PR #4030 变更 |
+|------|-------------------|--------------|
+| **CongestionControl 版本** | 仅 `Version1` | 新增 `Version2`（含 `Used/Max` 字段） |
+| **AvailableMemory 字段** | `Available`, `DispatcherCount`, `DispatcherAvailable` | 新增 `Used`, `Max` |
+| **EventCollector 方法** | `AddAvailableMemoryWithDispatchers` | 新增 `AddAvailableMemoryWithDispatchersAndUsage` |
+| **scan_window.go** | ❌ 不存在 | ✅ 新增（内存压力感知扫描窗口算法） |
+| **DDL Workload Framework** | ❌ 不存在 | ✅ 新增（`tools/workload/ddl*.go`） |
+
+### 新增组件 1：Scan Window Algorithm（`pkg/eventservice/scan_window.go`）
+
+**核心功能**：基于内存压力动态调整 scan interval
+
+```golang
+// pkg/eventservice/scan_window.go (PR 新增)
+type memoryUsageWindow struct {
+    samples  []memoryUsageSample  // 滑动窗口采样
+    window   time.Duration        // 30s 窗口
+    maxBytes uint64               // 最大内存
+}
+
+type memoryUsageSample struct {
+    ts       time.Time
+    used     uint64
+    capacity uint64
+}
+```
+
+**算法特点**：
+- **"Fast brake, slow accelerate"**：内存压力大时立即降低 interval，压力小时需要冷却期才增加
+- **分层阈值响应**：
+  - `memoryUsageCriticalThreshold` (90%): 降低 interval 到 1/4
+  - `memoryUsageHighThreshold` (70%): 降低 interval 到 1/2
+  - `increasingTrendStartRatio` (30%): 趋势预测，降低 10%
+  - `memoryUsageLowThreshold` (20%): 增加 25%
+  - `memoryUsageVeryLowThreshold` (10%): 增加 50%
+
+**调用链**：
+```
+EventBroker.HandleCongestionControl
+  ↓
+changefeedStatus.updateMemoryUsage(used, max, available)
+  ↓
+memoryUsageWindow.addSample(now, used, capacity)
+  ↓
+adjustScanInterval() → 动态调整 scanInterval
+```
+
+### 新增组件 2：DDL Workload Framework（`tools/workload/`）
+
+**用途**：测试 DDL 负载对内存控制的影响
+
+**新增文件**：
+- `ddl_app.go`, `ddl_config.go`, `ddl_executor.go`, `ddl_runner.go`, `ddl_types.go`
+
+### CodeRabbit AI 评审关键问题（2026-02-13）
+
+#### 问题 1：`changefeedUsedMemory` 使用 `min()` 可能低估内存压力 ⚠️ **Major**
+
+```golang
+// PR 代码（可能有问题）
+changefeedUsedMemory[cfID] = min(existing, uint64(quota.MemoryUsage()))
+
+// 建议修改
+changefeedUsedMemory[cfID] = max(existing, uint64(quota.MemoryUsage()))
+```
+
+**分析**：
+- `changefeedUsedMemory` 使用 `min()` 会**低估**内存压力
+- `changefeedMaxMemory` 使用 `min()` 是保守的（报告更小容量）
+- `changefeedUsedMemory` 应该使用 `max()` 以**保守估计**内存压力
+
+#### 问题 2：未使用的 `lastRatio` 字段
+
+```golang
+// pkg/eventservice/dispatcher_stat.go (PR 新增)
+type changefeedStatus struct {
+    // ...
+    lastRatio atomic.Float64  // ❌ 声明但从未使用
+}
+```
+
+#### 问题 3：文档注释阈值与实际常量不匹配
+
+```golang
+// 注释说的阈值
+// - Critical (>80%): Reduce interval to 1/4
+
+// 实际常量
+const memoryUsageCriticalThreshold = 90  // 实际是 90%，不是 80%
+```
+
+#### 问题 4：DDL Worker 重试逻辑问题
+
+- 初始连接失败时直接 `return`，导致 worker 永久丢失
+- 建议实现重试循环
+
+### 数据流图（PR #4030）
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     EventCollector (Downstream)                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ newCongestionControlMessages()                             │ │
+│  │  ├─ 从 main/redo ds 收集 MemoryMetrics                     │ │
+│  │  ├─ changefeedUsedMemory[cfID] = min/max(?) ← 问题点       │ │
+│  │  ├─ changefeedMaxMemory[cfID] = min()                      │ │
+│  │  └─ AddAvailableMemoryWithDispatchersAndUsage()            │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└────────────────────────────┬────────────────────────────────────┘
+                             │ CongestionControl v2
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       EventBroker (EventService)                 │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ HandleCongestionControl()                                  │ │
+│  │  ├─ 解析 Used/Max/Available                                │ │
+│  │  ├─ changefeedStatus.updateMemoryUsage()                   │ │
+│  │  │    └─ memoryUsageWindow.addSample()                     │ │
+│  │  └─ adjustScanInterval()                                   │ │
+│  │       ├─ Critical (>90%): 1/4 interval                     │ │
+│  │       ├─ High (>70%): 1/2 interval                         │ │
+│  │       ├─ Trend (>30%): 10% reduction                       │ │
+│  │       ├─ Low (<20%): +25% increase                         │ │
+│  │       └─ Very Low (<10%): +50% increase                    │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 待解决问题汇总
+
+| 问题 | 严重程度 | 状态 |
+|------|---------|------|
+| `changefeedUsedMemory` 使用 `min()` 低估压力 | Major | 待修复 |
+| 未使用的 `lastRatio` 字段 | Minor | 待清理 |
+| 文档注释阈值不匹配 | Minor | 待更新 |
+| DDL Worker 重试逻辑 | Major | 待修复 |
+| 缺少 copyright header | Minor | 待添加 |
+
 ---
 
 ## 现有问题与根本原因
@@ -286,3 +431,25 @@ const (
 ---
 
 说明：本文档仅聚焦关联点与交互路径；Memory Controller 的内部算法与释放链路详见 `docs/code_reading/memorycontroller.md`。
+
+---
+
+## 术语汇总
+
+| 术语 | 定义 |
+|------|------|
+| **CongestionControl** | 拥塞控制消息，用于 EventCollector 向 EventBroker 报告内存状态 |
+| **AvailableMemory** | 单个 changefeed 的可用内存信息，包含 `Available`/`Used`/`Max` |
+| **memoryUsageWindow** | 滑动窗口采样器，用于平滑内存使用率计算 |
+| **scanInterval** | 扫描间隔，EventBroker 根据 memoryUsageWindow 动态调整 |
+| **Dispatcher** | 事件分发器，负责将事件发送到下游 |
+| **SyncPoint** | 同步点事件，需要所有 dispatcher 对齐进度 |
+| **NonBatchable** | 不可批量处理的事件类型，需要单独处理 |
+
+---
+
+## 参考链接
+
+- **PR #4030**: https://github.com/pingcap/ticdc/pull/4030
+- **Issue #4172**: Improve eventBroker Scan Strategy with Memory-Aware Scan Window Algorithm
+- **相关文档**: `docs/code_reading/memorycontroller.md`
