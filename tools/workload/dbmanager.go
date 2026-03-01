@@ -16,6 +16,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,7 +56,7 @@ func (m *DBManager) SetupConnections() error {
 
 // setupMultipleDatabases sets up connections to multiple databases
 func (m *DBManager) setupMultipleDatabases() error {
-	m.DBs = make([]*DBWrapper, m.Config.DBNum)
+	m.DBs = make([]*DBWrapper, 0, m.Config.DBNum)
 	for i := 0; i < m.Config.DBNum; i++ {
 		dbName := fmt.Sprintf("%s%d", m.Config.DBPrefix, i+1)
 		db, err := m.createDBConnection(dbName)
@@ -64,11 +65,11 @@ func (m *DBManager) setupMultipleDatabases() error {
 			continue
 		}
 		m.configureDBConnection(db)
-		m.DBs[i] = &DBWrapper{
+		m.DBs = append(m.DBs, &DBWrapper{
 			DB:         db,
 			Name:       dbName,
 			UsageCount: 0,
-		}
+		})
 	}
 
 	if len(m.DBs) == 0 {
@@ -113,9 +114,47 @@ func (m *DBManager) GetDB() *DBWrapper {
 // createDBConnection creates a database connection
 func (m *DBManager) createDBConnection(dbName string) (*sql.DB, error) {
 	plog.Info("create db connection", zap.String("dbName", dbName))
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local&maxAllowedPacket=1073741824&multiStatements=true",
+	if err := m.ensureDatabaseExists(dbName); err != nil {
+		return nil, err
+	}
+
+	db, err := sql.Open("mysql", m.buildDSN(dbName))
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func (m *DBManager) buildDSN(dbName string) string {
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local&maxAllowedPacket=1073741824&multiStatements=true",
 		m.Config.DBUser, m.Config.DBPassword, m.Config.DBHost, m.Config.DBPort, dbName)
-	return sql.Open("mysql", dsn)
+}
+
+func (m *DBManager) ensureDatabaseExists(dbName string) error {
+	if dbName == "" {
+		return nil
+	}
+
+	adminDB, err := sql.Open("mysql", m.buildDSN(""))
+	if err != nil {
+		return err
+	}
+	defer adminDB.Close()
+
+	if err := adminDB.Ping(); err != nil {
+		return err
+	}
+
+	escapedName := strings.ReplaceAll(dbName, "`", "``")
+	createDBSQL := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", escapedName)
+	if _, err := adminDB.Exec(createDBSQL); err != nil {
+		return err
+	}
+	return nil
 }
 
 // configureDBConnection configures a database connection
