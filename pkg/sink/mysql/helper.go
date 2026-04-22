@@ -635,6 +635,8 @@ func ddlSessionTimestampFromOriginDefault(event *commonEvent.DDLEvent, timezone 
 		return 0, false
 	}
 
+	var firstTS float64
+	var firstCol string
 	for _, col := range event.TableInfo.GetColumns() {
 		if _, ok := targetColumns[col.Name.L]; !ok {
 			continue
@@ -652,15 +654,30 @@ func ddlSessionTimestampFromOriginDefault(event *commonEvent.DDLEvent, timezone 
 				zap.Error(err))
 			continue
 		}
-		log.Info("Using OriginDefaultValue for DDL timestamp",
-			zap.String("column", col.Name.O),
-			zap.String("originDefault", valStr),
-			zap.Float64("timestamp", ts),
-			zap.String("timezone", timezone))
-		return ts, true
+		if firstCol == "" {
+			firstTS = ts
+			firstCol = col.Name.O
+			continue
+		}
+		if ts != firstTS {
+			log.Warn("Multiple CURRENT_TIMESTAMP columns with different origin defaults in same DDL; SET TIMESTAMP can only use one value",
+				zap.String("firstColumn", firstCol),
+				zap.Float64("firstTimestamp", firstTS),
+				zap.String("column", col.Name.O),
+				zap.Float64("timestamp", ts),
+				zap.String("query", event.GetDDLQuery()))
+		}
 	}
 
-	return 0, false
+	if firstCol == "" {
+		return 0, false
+	}
+	log.Info("Using OriginDefaultValue for DDL timestamp",
+		zap.String("column", firstCol),
+		zap.Float64("timestamp", firstTS),
+		zap.String("timezone", timezone),
+		zap.Int("matchedColumns", len(targetColumns)))
+	return firstTS, true
 }
 
 func extractCurrentTimestampDefaultColumns(query string) (map[string]struct{}, error) {
