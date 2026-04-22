@@ -725,7 +725,8 @@ func isCurrentTimestampExpr(expr ast.ExprNode) bool {
 
 func isCurrentTimestampFuncName(name string) bool {
 	switch name {
-	case ast.CurrentTimestamp, ast.Now, ast.LocalTime, ast.LocalTimestamp:
+	case ast.CurrentTimestamp, ast.Now, ast.LocalTime, ast.LocalTimestamp,
+		ast.CurrentDate, ast.CurrentTime, ast.Curdate, ast.Curtime:
 		return true
 	default:
 		return false
@@ -752,14 +753,31 @@ func resolveOriginDefaultLocation(col *timodel.ColumnInfo, timezone string) (*ti
 }
 
 func parseTimestampInLocation(val string, loc *time.Location) (float64, error) {
-	formats := []string{
+	// Try full datetime formats first.
+	datetimeFormats := []string{
 		"2006-01-02 15:04:05",
 		"2006-01-02 15:04:05.999999",
+		"2006-01-02",
 	}
-	for _, f := range formats {
+	for _, f := range datetimeFormats {
 		t, err := time.ParseInLocation(f, val, loc)
 		if err == nil {
 			return float64(t.UnixNano()) / float64(time.Second), nil
+		}
+	}
+	// TIME-only formats: anchor to epoch so the time-of-day is preserved.
+	// SET TIMESTAMP only needs the correct time-of-day for CURRENT_TIME/CURTIME().
+	timeFormats := []string{
+		"15:04:05",
+		"15:04:05.999999",
+	}
+	for _, f := range timeFormats {
+		t, err := time.ParseInLocation(f, val, loc)
+		if err == nil {
+			// Replace the date with 1970-01-01 to get a valid unix timestamp
+			// that preserves the time-of-day in the given location.
+			anchored := time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc)
+			return float64(anchored.UnixNano()) / float64(time.Second), nil
 		}
 	}
 	return 0, fmt.Errorf("failed to parse timestamp: %s", val)
